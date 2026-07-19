@@ -1,0 +1,83 @@
+{
+  "app": {
+    "name": "परीक्षa",
+    "version": "1.0.0",
+    "timezone": "Asia/Kolkata",
+    "default_theme": "default",
+    "default_locale": "en"
+  },
+  "maintenance": {
+    "enabled": false,
+    "read_only": false,
+    "admin_only": false,
+    "emergency_lock": false,
+    "message": "We are undergoing scheduled maintenance. Please try again shortly."
+  },
+  "features": {
+    "ENABLE_ADS": false,
+    "ENABLE_SUBSCRIPTIONS": false,
+    "ENABLE_AI_COACH": true,
+    "ENABLE_ANALYTICS": true,
+    "ENABLE_IMPORT": true,
+    "ENABLE_PAYMENTS": false,
+    "ENABLE_ADMIN_PANEL": true,
+    "ENABLE_MAINTENANCE_MODE": false,
+    "ENABLE_LEADERBOARD": false,
+    "ENABLE_WALLET": false,
+    "ENABLE_COUPONS": false,
+    "ENABLE_REFERRALS": false,
+    "ENABLE_PDF_EXPORT": false,
+    "ENABLE_DARK_THEME": true,
+    "ENABLE_QUESTION_BANK": true,
+    "ENABLE_EXAM_RULES": true,
+    "ENABLE_GUEST_ACCESS": true,
+    "ENABLE_GOOGLE_LOGIN": false,
+    "ENABLE_PHONE_OTP": false,
+    "ENABLE_EMAIL_PASSWORD_LOGIN": true,
+    "NOTIFICATIONS_ENABLED": true,
+    "ENABLE_NOTIFICATIONS": true,
+    "TELEGRAM_ENABLED": false,
+    "EMAIL_ENABLED": false,
+    "ENABLE_ADMIN_BROADCAST": true,
+    "ENABLE_SYSTEM_ALERTS": true,
+    "ENABLE_REMINDERS": true
+  },
+  "auth": {
+    "google_client_id": "",
+    "phone_otp_dev_expose": false
+  },
+  "notifications": {
+    "default_channels": ["in_app"]
+  },
+  "monetization": {
+    "mode": "free",
+    "currency": "INR",
+    "trial_days": 7,
+    "grace_period_days": 3,
+    "free_daily_exam_limit": 0
+  },
+  "ads": {
+    "enabled": false,
+    "provider": "none",
+    "client_id": "",
+    "slots": {
+      "website": false,
+      "dashboard": true,
+      "question_page": false,
+      "results_page": true
+    },
+    "show_for_free_users": true,
+    "show_for_guests": true,
+    "hide_for_premium": true,
+    "disable_during_exam": true,
+    "disable_during_review": true
+  },
+  "subscriptions": {
+    "enabled": false
+  },
+  "payments": {
+    "enabled": false,
+    "provider": "none",
+    "currency": "INR"
+  }
+}

@@ -49,7 +49,10 @@ _DEFAULT_UPLOAD_DIR: Final[Path] = _BACKEND_ROOT / "uploads"
 _DEFAULT_SECRET_KEY: Final[str] = "exam-os-dev-secret-change-in-production"
 _DEFAULT_JWT_SECRET_KEY: Final[str] = "exam-os-jwt-secret-change-in-production"
 
-_DEFAULT_CORS: Final[str] = "http://localhost:5173,http://127.0.0.1:5173"
+_DEFAULT_CORS: Final[str] = (
+    "http://localhost:5173,http://127.0.0.1:5173,"
+    "https://exam-os-frontend-azure.vercel.app,https://exam-os-frontend.vercel.app"
+)
 _DEFAULT_MAX_UPLOAD_BYTES: Final[int] = 16 * 1024 * 1024  # 16 MiB
 _MIN_UPLOAD_BYTES: Final[int] = 1024  # 1 KiB floor — reject absurd zeros
 _MAX_UPLOAD_BYTES_CAP: Final[int] = 100 * 1024 * 1024  # 100 MiB hard ceiling
@@ -209,6 +212,13 @@ def _parse_cors_origins(raw: Optional[str]) -> List[str]:
     text = raw if raw is not None else _DEFAULT_CORS
     origins: List[str] = []
     seen = set()
+    for origin in (
+        "https://exam-os-frontend-azure.vercel.app",
+        "https://exam-os-frontend.vercel.app",
+    ):
+        if origin not in seen:
+            seen.add(origin.lower())
+            origins.append(origin)
     for part in text.split(","):
         origin = part.strip().rstrip("/")
         if not origin:

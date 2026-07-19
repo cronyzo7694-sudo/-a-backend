@@ -208,6 +208,14 @@ def _register_request_hooks(app: Flask) -> None:
         if req_id:
             response.headers.setdefault("X-Request-ID", req_id)
 
+        logger.info(
+            "backend %s %s -> %s req_id=%s",
+            request.method,
+            request.path,
+            response.status_code,
+            req_id,
+        )
+
         # JSON APIs should not be framed or cached by shared proxies mid-exam
         if request.path.startswith("/api/"):
             response.headers.setdefault("Content-Type", "application/json; charset=utf-8")

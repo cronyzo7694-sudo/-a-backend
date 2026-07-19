@@ -51,7 +51,10 @@ _DEFAULT_JWT_SECRET_KEY: Final[str] = "exam-os-jwt-secret-change-in-production"
 
 _DEFAULT_CORS: Final[str] = (
     "http://localhost:5173,http://127.0.0.1:5173,"
-    "https://exam-os-frontend-azure.vercel.app,https://exam-os-frontend.vercel.app"
+    "https://exam-os-frontend-azure.vercel.app,"
+    "https://exam-os-frontend.vercel.app,"
+    "https://exam-os-frontend-lxem7xtya-cronyzo.vercel.app,"
+    "https://exam-os-frontend-4kit4s83e-cronyzo.vercel.app"
 )
 _DEFAULT_MAX_UPLOAD_BYTES: Final[int] = 16 * 1024 * 1024  # 16 MiB
 _MIN_UPLOAD_BYTES: Final[int] = 1024  # 1 KiB floor — reject absurd zeros

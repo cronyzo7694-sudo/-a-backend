@@ -35,3 +35,4 @@ marshmallow==3.23.1
 
 # --- Optional Neon / PostgreSQL (uncomment or install separately) ---
 # psycopg[binary]>=3.2.0
+psycopg2-binary==2.9.10

@@ -531,3 +531,76 @@ def unpublish_exam(exam_id):
 # - Schedule window enforcement (starts_at/ends_at) on start_attempt
 # - Optimistic locking when publishing concurrent edits
 # --------------------------------------------
+
+# FILE-BASED EXAM - Code ke sath question file daalo, test ban jayega
+@exams_bp.post("/import-from-files")
+@roles_required("admin")
+def import_from_files():
+    try:
+        from app.services.file_bank import FILE_QUESTIONS
+        if not FILE_QUESTIONS:
+            return jsonify({"error": "questions_data folder me koi txt file nahi mili"}), 404
+        
+        # Ek naya exam banao file wale questions se
+        exam = Exam(
+            title=f"File Based Test - {len(FILE_QUESTIONS)} Questions",
+            description=f"Auto created from {len(FILE_QUESTIONS)} file questions",
+            duration_seconds=3600,
+            status="published",
+            exam_mode="mock"
+        )
+        db.session.add(exam)
+        db.session.flush()
+        
+        # Ek section banao
+        section = ExamSection(
+            exam_id=exam.id,
+            title="General",
+            order_index=0
+        )
+        db.session.add(section)
+        db.session.flush()
+        
+        # File ke questions ko DB questions banao + exam me add karo
+        count = 0
+        for fq in FILE_QUESTIONS[:500]:  # Pehle 500 le, 2 lakh nahi ek saath
+            try:
+                q = Question(
+                    question_text=fq["question_text"][:2000],
+                    question_type="single_choice",
+                    difficulty="medium",
+                    correct_answer="A",
+                    marks=2,
+                    is_active=True
+                )
+                db.session.add(q)
+                db.session.flush()
+                
+                # Options
+                from app.models.question import QuestionOption
+                for idx, opt in enumerate(fq.get("options", [])[:4]):
+                    db.session.add(QuestionOption(
+                        question_id=q.id,
+                        option_key=opt.get("option_key","A"),
+                        option_text=opt.get("option_text","")[:500],
+                        order_index=idx
+                    ))
+                
+                # Exam me add
+                db.session.add(ExamQuestion(
+                    exam_id=exam.id,
+                    section_id=section.id,
+                    question_id=q.id,
+                    order_index=count,
+                    marks=2
+                ))
+                count += 1
+            except Exception:
+                continue
+        
+        db.session.commit()
+        return jsonify({"message": f"File se {count} questions ka test ban gaya", "exam_id": exam.id, "exam": exam.to_dict()}), 201
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)[:500]}), 500

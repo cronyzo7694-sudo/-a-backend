@@ -41,6 +41,10 @@ _QUESTION_COLUMNS: Sequence[Tuple[str, str]] = (
     ("is_favorite", "BOOLEAN DEFAULT 0"),
 )
 
+_EXAM_COLUMNS: Sequence[Tuple[str, str]] = (
+    ("parent_exam_id", "INTEGER"),
+)
+
 
 def _existing_columns(table: str) -> set:
     try:
@@ -94,6 +98,7 @@ def ensure_additive_schema() -> None:
 
     _add_columns("users", _USER_COLUMNS)
     _add_columns("questions", _QUESTION_COLUMNS)
+    _add_columns("exams", _EXAM_COLUMNS)
 
     # Helpful indexes (ignore failures)
     index_ddls = [

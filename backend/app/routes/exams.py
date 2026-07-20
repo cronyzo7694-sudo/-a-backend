@@ -98,6 +98,15 @@ def list_exams():
         if mode not in EXAM_MODES:
             return jsonify({"error": "Invalid exam_mode"}), 400
         q = q.filter_by(exam_mode=mode)
+    if request.args.get("parent_id") is not None:
+        parent_id_raw = request.args.get("parent_id") or ""
+        if parent_id_raw.strip().lower() in ("null", "none", "nil", ""):
+            q = q.filter(Exam.parent_exam_id.is_(None))
+        else:
+            parent_id = _safe_int(parent_id_raw)
+            if parent_id is None:
+                return jsonify({"error": "Invalid parent_id"}), 400
+            q = q.filter_by(parent_exam_id=parent_id)
     search = (request.args.get("search") or "").strip()[:_MAX_SEARCH]
     if search:
         q = q.filter(Exam.title.ilike(f"%{_escape_like(search)}%", escape="\\"))
@@ -127,6 +136,13 @@ def get_exam(exam_id):
     include_q = request.args.get("include_questions", "false").lower() == "true"
     # Never leak answers on public get
     data = exam.to_dict(include_sections=True, include_questions=include_q)
+    if exam.parent_exam_id is None:
+        children_q = Exam.query.filter_by(parent_exam_id=exam.id)
+        if claims.get("role") != "admin":
+            children_q = children_q.filter_by(status="published")
+        children = children_q.order_by(Exam.id.desc()).all()
+        if children:
+            data["children"] = [c.to_dict(include_sections=True) for c in children]
     if include_q and claims.get("role") != "admin":
         _strip_answers_from_exam_dict(data)
     # Additive: resolved rule pack for clients (backward compatible)
@@ -156,6 +172,16 @@ def create_exam():
     if status not in EXAM_STATUSES:
         status = "draft"
 
+    parent_exam_id = data.get("parent_exam_id")
+    if parent_exam_id not in (None, ""):
+        parent_exam_id = _safe_int(parent_exam_id)
+        if parent_exam_id is None:
+            return jsonify({"error": "Invalid parent_exam_id"}), 400
+        if not Exam.query.get(parent_exam_id):
+            return jsonify({"error": "parent_exam_id references unknown exam"}), 400
+    else:
+        parent_exam_id = None
+
     duration = _safe_int(data.get("duration_seconds", 3600), 3600) or 3600
     duration = max(_MIN_DURATION, min(duration, _MAX_DURATION))
 
@@ -175,6 +201,7 @@ def create_exam():
         instructions=_clip(data.get("instructions"), _MAX_TEXT),
         exam_mode=exam_mode,
         status=status,
+        parent_exam_id=parent_exam_id,
         duration_seconds=duration,
         strict_sections=bool(data.get("strict_sections", False)),
         default_marks=_safe_float(data.get("default_marks", 1.0), 1.0),
@@ -240,6 +267,19 @@ def update_exam(exam_id):
         duration = _safe_int(data["duration_seconds"])
         if duration is not None:
             exam.duration_seconds = max(_MIN_DURATION, min(duration, _MAX_DURATION))
+    if "parent_exam_id" in data:
+        parent_exam_id = data.get("parent_exam_id")
+        if parent_exam_id in (None, ""):
+            exam.parent_exam_id = None
+        else:
+            parent_exam_id = _safe_int(parent_exam_id)
+            if parent_exam_id is None:
+                return jsonify({"error": "Invalid parent_exam_id"}), 400
+            if parent_exam_id == exam.id:
+                return jsonify({"error": "Exam cannot be its own parent"}), 400
+            if not Exam.query.get(parent_exam_id):
+                return jsonify({"error": "parent_exam_id references unknown exam"}), 400
+            exam.parent_exam_id = parent_exam_id
     if "max_tab_switches" in data and data["max_tab_switches"] is not None:
         tabs = _safe_int(data["max_tab_switches"])
         if tabs is not None and tabs >= 0:

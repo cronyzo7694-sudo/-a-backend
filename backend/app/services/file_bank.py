@@ -8,18 +8,49 @@ BASE = Path(__file__).parent.parent / "questions_data"
 
 # Try to import knowledge engine classifier for smart classification
 try:
-    from app.services.knowledge_engine.classifier import classify_subject_chapter, detect_bloom, detect_difficulty
+    from app.services.knowledge_engine.classifier import classify_subject_chapter as local_classify, detect_bloom, detect_difficulty
     from app.services.knowledge_engine.preprocessor import clean_junk
     KNOWLEDGE_AVAILABLE = True
 except Exception:
     KNOWLEDGE_AVAILABLE = False
-    def classify_subject_chapter(q, opts):
+    def local_classify(q, opts):
         # Fallback simple
         ql = q.lower()
         if "analogy" in ql or ":" in q and "::" in q:
             return {"subject": "Reasoning", "chapter": "Analogy", "topic": "Word Analogy", "concepts": ["Analogy"], "pattern": "A:B::C:?", "question_family": "Analogy"}
         if any(x in ql for x in ["number", "series", "132", "156"]):
             return {"subject": "Reasoning", "chapter": "Analogy", "topic": "Number Analogy", "concepts": ["Number Analogy"], "pattern": "Number Relation", "question_family": "Analogy"}
+        return {"subject": "Reasoning", "chapter": "Analogy", "topic": "General", "concepts": [], "pattern": None, "question_family": "Analogy"}
+
+# Free AI chain - DeepSeek + Gemini + ChatGPT free - for kadak classification
+try:
+    from app.services.knowledge_engine.free_ai_chain import classify_with_free_ai_chain, ensemble_classify
+    FREE_AI_AVAILABLE = True
+except Exception:
+    FREE_AI_AVAILABLE = False
+
+def smart_classify(question_text, options=None):
+    """Use free AI chain if keys available, else local heuristic - always kadak"""
+    options = options or []
+    # First try free AI chain (Gemini/DeepSeek/OpenRouter/Groq free)
+    if FREE_AI_AVAILABLE:
+        try:
+            # Check if any free AI key is set
+            if any([os.getenv("GEMINI_API_KEY"), os.getenv("DEEPSEEK_API_KEY"), os.getenv("OPENROUTER_API_KEY"), os.getenv("GROQ_API_KEY")]):
+                ai_result = classify_with_free_ai_chain(question_text, local_classify)
+                if ai_result and ai_result.get("subject"):
+                    # Merge with local for missing fields
+                    local = local_classify(question_text, options)
+                    # AI result takes priority
+                    merged = {**local, **ai_result}
+                    return merged
+        except Exception:
+            pass
+    
+    # Fallback to local classifier (no API needed, always works)
+    try:
+        return local_classify(question_text, options)
+    except Exception:
         return {"subject": "Reasoning", "chapter": "Analogy", "topic": "General", "concepts": [], "pattern": None, "question_family": "Analogy"}
 
 def load_questions_from_files():
@@ -60,9 +91,9 @@ def load_questions_from_files():
             if len(q_text) < 10:
                 continue
             
-            # Smart classification using knowledge engine if available
+            # Smart classification - FREE AI Chain: Gemini -> DeepSeek -> OpenRouter -> Groq -> Local
             try:
-                classification = classify_subject_chapter(q_text, [{"option_text": o[1]} for o in opts])
+                classification = smart_classify(q_text, [{"option_text": o[1]} for o in opts])
             except Exception:
                 classification = {"subject": "Reasoning", "chapter": "Analogy", "topic": "General", "concepts": [], "pattern": None, "question_family": "Analogy"}
             

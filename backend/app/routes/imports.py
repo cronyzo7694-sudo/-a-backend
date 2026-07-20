@@ -32,6 +32,19 @@ from app.services.question_hash import compute_question_hash
 from app.utils.decorators import roles_required
 from app.utils.validators import OPTION_KEYS
 
+# Knowledge Engine - Internal Brain (additive, never breaks existing)
+try:
+    from app.services.knowledge_engine.pipeline import knowledge_engine
+    from app.models.knowledge import QuestionAppearance, KnowledgeIngestionJob
+    KNOWLEDGE_ENGINE_AVAILABLE = True
+except Exception as e:
+    # Fallback if engine not fully loaded (e.g., during migrations)
+    knowledge_engine = None
+    QuestionAppearance = None
+    KnowledgeIngestionJob = None
+    KNOWLEDGE_ENGINE_AVAILABLE = False
+    # Will log at runtime
+
 imports_bp = Blueprint("imports", __name__)
 logger = logging.getLogger("exam_os.routes.imports")
 
@@ -41,6 +54,11 @@ _MAX_CSV_BYTES: Final[int] = 5 * 1024 * 1024
 _MAX_TEXT: Final[int] = 50_000
 _MAX_OPTIONS: Final[int] = 10
 _MAX_ERRORS_STORED: Final[int] = 200
+
+# Knowledge Engine limits - supports thousands per import
+_MAX_AI_TEXT_BYTES: Final[int] = 10 * 1024 * 1024  # 10MB raw text
+_MAX_AI_FILE_BYTES: Final[int] = 20 * 1024 * 1024  # 20MB file
+_MAX_AI_QUESTIONS_PER_BATCH: Final[int] = 5000
 
 
 def _utcnow():
@@ -822,3 +840,850 @@ def list_import_jobs():
 def get_import_job(job_id):
     job = ImportJob.query.get_or_404(job_id)
     return jsonify(job.to_dict())
+
+
+# ============================================================
+# KNOWLEDGE ENGINE - Internal Brain - AI Import Endpoints
+# ============================================================
+
+def _extract_text_from_file(file_bytes: bytes, filename: str, ext: str) -> str:
+    """
+    Layer 1: INTAKE - Accept ANY format and extract raw text
+    Supports PDF, DOCX, CSV, JSON, HTML, MD, TXT with graceful fallback
+    """
+    ext = (ext or "").lower().strip(".")
+    text = ""
+
+    if ext == "pdf":
+        # Try PyMuPDF (fitz) if available, else pypdf, else fallback
+        try:
+            import fitz  # PyMuPDF
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            text = "\n".join([page.get_text() for page in doc])
+            if text.strip():
+                return text
+        except Exception:
+            pass
+        try:
+            # Try pypdf as fallback
+            import io as _io
+            from pypdf import PdfReader
+            reader = PdfReader(_io.BytesIO(file_bytes))
+            text = "\n".join([p.extract_text() or "" for p in reader.pages])
+            if text.strip():
+                return text
+        except Exception:
+            pass
+        # Final fallback - try decode (for text-based PDFs)
+        try:
+            text = file_bytes.decode('utf-8', errors='ignore')
+            if len(text.strip()) > 100:
+                return text
+        except Exception:
+            pass
+        return ""
+
+    elif ext == "docx":
+        try:
+            import docx
+            import io as _io
+            doc = docx.Document(_io.BytesIO(file_bytes))
+            text = "\n".join([p.text for p in doc.paragraphs])
+            if text.strip():
+                return text
+        except Exception:
+            pass
+        # Fallback decode
+        try:
+            return file_bytes.decode('utf-8', errors='ignore')
+        except Exception:
+            return ""
+
+    elif ext in ("json",):
+        try:
+            data = json.loads(file_bytes.decode('utf-8', errors='ignore'))
+            # If it's already structured questions, return as JSON string for pipeline
+            # Pipeline will handle blocks extraction
+            return json.dumps(data, ensure_ascii=False)
+        except Exception:
+            return file_bytes.decode('utf-8', errors='ignore')
+
+    elif ext in ("csv", "txt", "md", "html", "htm", "jsonl"):
+        try:
+            return file_bytes.decode('utf-8-sig', errors='ignore')
+        except Exception:
+            try:
+                return file_bytes.decode('latin-1', errors='ignore')
+            except Exception:
+                return ""
+
+    elif ext in ("png", "jpg", "jpeg", "webp", "bmp", "tiff"):
+        # OCR path - requires pytesseract + Pillow
+        try:
+            from PIL import Image
+            import pytesseract
+            import io as _io
+            img = Image.open(_io.BytesIO(file_bytes))
+            text = pytesseract.image_to_string(img)
+            # Also try Hindi if available
+            if not text.strip():
+                try:
+                    text = pytesseract.image_to_string(img, lang='eng+hin')
+                except Exception:
+                    pass
+            return text
+        except Exception as e:
+            logger.warning(f"OCR not available for image {filename}: {e}")
+            return ""
+
+    else:
+        # Generic try utf-8
+        try:
+            return file_bytes.decode('utf-8-sig', errors='ignore')
+        except Exception:
+            try:
+                return file_bytes.decode('latin-1', errors='ignore')
+            except Exception:
+                return ""
+
+
+def _save_canonical_to_db(
+    canonical,
+    user_id: Optional[int],
+    defaults: Dict[str, Any],
+    skip_duplicates: bool = True,
+) -> Tuple[Optional[Question], str, Optional[int]]:
+    """
+    Save canonical question to DB with appearance history merging
+    Returns (question, status, duplicate_of_id)
+    status: created | duplicate | error
+    """
+    from app.services.knowledge_engine.deduplicator import normalize_for_comparison
+
+    # Check duplicate via knowledge engine deduplicator
+    fingerprint = canonical.fingerprint_hash
+    semantic = canonical.semantic_hash
+    normalized = canonical.normalized_question
+
+    # If duplicate, merge appearance instead of creating
+    if skip_duplicates and canonical.duplicate_info.get("is_duplicate"):
+        dup_id = canonical.duplicate_info.get("duplicate_of")
+        if dup_id:
+            existing = Question.query.get(dup_id)
+            if existing:
+                # Merge appearance history
+                if QuestionAppearance and canonical.appearance_history:
+                    try:
+                        for app in canonical.appearance_history:
+                            # Avoid duplicate appearance
+                            exists_app = QuestionAppearance.query.filter_by(
+                                question_id=existing.id,
+                                exam_name=app.get("exam_name"),
+                                exam_year=app.get("exam_year"),
+                                source_book=app.get("source_book"),
+                                page_number=app.get("page_number"),
+                            ).first()
+                            if not exists_app:
+                                new_app = QuestionAppearance(
+                                    question_id=existing.id,
+                                    exam_name=app.get("exam_name"),
+                                    exam_year=app.get("exam_year"),
+                                    exam_date=app.get("exam_date"),
+                                    shift=app.get("shift"),
+                                    session=app.get("session"),
+                                    organization=app.get("organization"),
+                                    board=app.get("board"),
+                                    source_book=app.get("source_book"),
+                                    source_type=app.get("source_type", "book"),
+                                    page_number=app.get("page_number"),
+                                    question_number=app.get("question_number"),
+                                    language_detected=app.get("language_detected", "en"),
+                                    source_hash=app.get("source_hash"),
+                                )
+                                db.session.add(new_app)
+                        # Update appearance count
+                        try:
+                            existing.appearance_count = (existing.appearance_count or 0) + 1
+                        except Exception:
+                            pass
+                        db.session.flush()
+                    except Exception as e:
+                        logger.warning(f"appearance merge failed for q={existing.id}: {e}")
+                return existing, "duplicate", dup_id
+
+    # Resolve taxonomy with auto-create
+    subject_name = canonical.classification.get("subject")
+    chapter_name = canonical.classification.get("chapter")
+    topic_name = canonical.classification.get("topic")
+
+    subject_id = defaults.get("subject_id")
+    chapter_id = defaults.get("chapter_id")
+
+    # Auto-create subject if needed
+    if not subject_id and subject_name:
+        s = Subject.query.filter(Subject.name.ilike(subject_name.strip()[:200])).first()
+        if not s and defaults.get("auto_create", True):
+            s = Subject(name=subject_name.strip()[:200], is_active=True)
+            db.session.add(s)
+            db.session.flush()
+        if s:
+            subject_id = s.id
+
+    if not chapter_id and chapter_name and subject_id:
+        c = Chapter.query.filter(
+            Chapter.subject_id == subject_id,
+            Chapter.name.ilike(chapter_name.strip()[:200]),
+        ).first()
+        if not c and defaults.get("auto_create", True):
+            c = Chapter(subject_id=subject_id, name=chapter_name.strip()[:200], is_active=True)
+            db.session.add(c)
+            db.session.flush()
+        if c:
+            chapter_id = c.id
+
+    # If still no subject/chapter, use defaults or keep null (question stays in bank)
+    if not subject_id:
+        subject_id = _safe_int(defaults.get("subject_id"))
+    if not chapter_id:
+        chapter_id = _safe_int(defaults.get("chapter_id"))
+
+    # Build Question model payload
+    qtype = canonical.question_type
+    if qtype not in QUESTION_TYPES:
+        # Map extended types to existing
+        mapping = {
+            "assertion_reason": "single_choice",
+            "statement_based": "single_choice",
+            "match_the_following": "single_choice",
+            "fill_blank": "single_choice",
+            "true_false": "single_choice",
+            "integer": "integer",
+            "paragraph": "paragraph",
+            "image_based": "image",
+            "multiple_choice": "multiple_choice",
+        }
+        qtype = mapping.get(qtype, "single_choice")
+
+    # Correct answer
+    correct = canonical.correct_answer
+    if correct is None:
+        # NO HALLUCINATION - keep empty string but mark needs_review
+        stored_correct = ""
+    elif isinstance(correct, list):
+        stored_correct = json.dumps([str(x).upper() for x in correct])
+    else:
+        stored_correct = str(correct).strip().upper() or ""
+
+    # Marks
+    marks = _safe_float(defaults.get("marks") or 2.0, 2.0)
+    neg_marks = _safe_float(defaults.get("negative_marks") or 0.5, 0.5)
+
+    # Tags
+    tags_str = ",".join(canonical.tags[:15])[:512]
+
+    # Create Question
+    try:
+        q = Question(
+            subject_id=subject_id,
+            chapter_id=chapter_id,
+            content_hash=fingerprint,
+            version=1,
+            question_type=qtype,
+            difficulty=canonical.classification.get("difficulty", "medium") if canonical.classification.get("difficulty") in DIFFICULTIES else "medium",
+            question_text=canonical.question_text[:_MAX_TEXT],
+            explanation=canonical.explanation[:_MAX_TEXT] if canonical.explanation else None,
+            paragraph_text=canonical.paragraph.get("text")[:_MAX_TEXT] if canonical.paragraph else None,
+            marks=marks,
+            negative_marks=neg_marks,
+            correct_answer=stored_correct,
+            tags=tags_str,
+            language=canonical.language_detected[:32] if canonical.language_detected else "en",
+            is_active=True,
+            status="needs_review" if canonical.needs_review else "active",
+            source=canonical.metadata.get("source_book") or canonical.metadata.get("exam_name") or defaults.get("source_book") or "AI Import",
+            year=_safe_int(canonical.metadata.get("exam_year") or defaults.get("exam_year")),
+            shift=_clip(canonical.metadata.get("shift"), 64),
+            tier=_clip(canonical.metadata.get("tier") or "Tier-1", 64),
+            is_pyq=bool(canonical.metadata.get("exam_name")),
+            is_book=bool(canonical.metadata.get("source_book") and "book" in str(canonical.metadata.get("source_book")).lower()),
+            is_practice=True,
+            created_by=user_id,
+        )
+
+        # Try to set extended fields if columns exist (via schema_upgrade)
+        try:
+            q.raw_text = canonical.raw_text[:20000] if hasattr(q, 'raw_text') else None
+        except Exception:
+            pass
+        try:
+            if hasattr(q, 'normalized_question'):
+                q.normalized_question = canonical.normalized_question[:10000]
+        except Exception:
+            pass
+        try:
+            if hasattr(q, 'semantic_hash'):
+                q.semantic_hash = semantic
+        except Exception:
+            pass
+        try:
+            if hasattr(q, 'source_hash'):
+                q.source_hash = canonical.source_hash
+        except Exception:
+            pass
+        try:
+            if hasattr(q, 'qid'):
+                q.qid = canonical.qid
+        except Exception:
+            pass
+        try:
+            if hasattr(q, 'semantic_summary'):
+                q.semantic_summary = canonical.semantic_summary[:1000]
+        except Exception:
+            pass
+        try:
+            if hasattr(q, 'classification_json'):
+                q.classification_json = json.dumps(canonical.classification, ensure_ascii=False)
+        except Exception:
+            pass
+        try:
+            if hasattr(q, 'confidence_score'):
+                q.confidence_score = canonical.confidence_score
+        except Exception:
+            pass
+        try:
+            if hasattr(q, 'needs_review'):
+                q.needs_review = canonical.needs_review
+        except Exception:
+            pass
+        try:
+            if hasattr(q, 'review_reason'):
+                q.review_reason = ",".join(canonical.review_reasons)[:255]
+        except Exception:
+            pass
+        try:
+            if hasattr(q, 'search_tokens'):
+                q.search_tokens = " ".join(canonical.keywords)[:2000]
+        except Exception:
+            pass
+        try:
+            if hasattr(q, 'embeddings_text'):
+                q.embeddings_text = canonical.semantic_summary[:2000]
+        except Exception:
+            pass
+        try:
+            if hasattr(q, 'question_family'):
+                q.question_family = canonical.classification.get("question_family", "")[:128]
+        except Exception:
+            pass
+        try:
+            if hasattr(q, 'pattern'):
+                q.pattern = canonical.classification.get("pattern", "")[:128]
+        except Exception:
+            pass
+        try:
+            if hasattr(q, 'bloom_taxonomy'):
+                q.bloom_taxonomy = canonical.classification.get("bloom_taxonomy", "")[:32]
+        except Exception:
+            pass
+        try:
+            if hasattr(q, 'expected_time_seconds'):
+                q.expected_time_seconds = canonical.classification.get("expected_time_seconds")
+        except Exception:
+            pass
+
+        db.session.add(q)
+        db.session.flush()
+
+        # Save options
+        if qtype != "integer" and canonical.options:
+            for idx, opt in enumerate(canonical.options[:_MAX_OPTIONS]):
+                db.session.add(
+                    QuestionOption(
+                        question_id=q.id,
+                        option_key=str(opt.get("option_key", "A"))[:8],
+                        option_text=str(opt.get("option_text", ""))[:_MAX_TEXT],
+                        order_index=idx,
+                    )
+                )
+
+        # Save appearance history
+        if QuestionAppearance and canonical.appearance_history:
+            for app in canonical.appearance_history:
+                try:
+                    new_app = QuestionAppearance(
+                        question_id=q.id,
+                        exam_name=app.get("exam_name"),
+                        exam_year=app.get("exam_year"),
+                        exam_date=app.get("exam_date"),
+                        shift=app.get("shift"),
+                        session=app.get("session"),
+                        organization=app.get("organization"),
+                        board=app.get("board"),
+                        source_book=app.get("source_book"),
+                        source_type=app.get("source_type", "book"),
+                        page_number=app.get("page_number"),
+                        question_number=app.get("question_number"),
+                        language_detected=app.get("language_detected", "en"),
+                        source_hash=app.get("source_hash"),
+                    )
+                    db.session.add(new_app)
+                except Exception:
+                    continue
+
+        # Map to exam if exam_id provided
+        exam_id = _safe_int(defaults.get("exam_id"))
+        if not exam_id and canonical.metadata.get("exam_name"):
+            exam_id = _resolve_exam_id({"exam": canonical.metadata.get("exam_name")}, defaults)
+        if exam_id:
+            _map_to_exam(q, exam_id, defaults)
+
+        db.session.flush()
+        return q, "created", None
+
+    except Exception as e:
+        logger.exception(f"Failed to save canonical qid={canonical.qid}: {e}")
+        db.session.rollback()
+        return None, "error", None
+
+
+def _run_ai_import(
+    canonical_questions: List,
+    user_id: Optional[int],
+    defaults: Dict[str, Any],
+    source_type: str,
+    file_name: Optional[str] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """
+    Run AI import with appearance merging and duplicate safety
+    """
+    # Create KnowledgeIngestionJob if model exists
+    k_job = None
+    if KnowledgeIngestionJob:
+        try:
+            k_job = KnowledgeIngestionJob(
+                user_id=user_id,
+                source_type=source_type,
+                file_name=file_name,
+                file_hash=hashlib.sha256((file_name or "").encode()).hexdigest()[:16] if file_name else None,
+                status="processing",
+                total_blocks_found=len(canonical_questions),
+                source_book=defaults.get("source_book"),
+                exam_name=defaults.get("exam_name"),
+                exam_year=_safe_int(defaults.get("exam_year")),
+            )
+            db.session.add(k_job)
+            db.session.flush()
+        except Exception:
+            k_job = None
+
+    created = []
+    duplicates = []
+    needs_review_list = []
+    errors = []
+    preview = []
+
+    if dry_run:
+        # No DB write, just preview
+        for idx, canon in enumerate(canonical_questions[:200]):
+            preview.append(canon.to_frontend_compatible())
+        if k_job:
+            try:
+                k_job.status = "preview"
+                k_job.questions_created = 0
+                k_job.duplicates_found = 0
+                k_job.needs_review = len([c for c in canonical_questions if c.needs_review])
+                k_job.preview_json = json.dumps(preview[:20], ensure_ascii=False)
+                k_job.completed_at = _utcnow()
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+
+        return {
+            "message": "AI Preview - no questions saved",
+            "knowledge_job": k_job.to_dict() if k_job else None,
+            "total_blocks_found": len(canonical_questions),
+            "questions_created": 0,
+            "duplicates_found": 0,
+            "needs_review": len([c for c in canonical_questions if c.needs_review]),
+            "questions": [c.to_full_knowledge_object() for c in canonical_questions[:50]],
+            "preview": preview[:50],
+            "errors": [],
+        }
+
+    # Actual import with transaction per batch
+    skip_dup = bool(defaults.get("skip_duplicates", True))
+
+    for idx, canon in enumerate(canonical_questions):
+        # Safety: max per batch
+        if idx >= _MAX_AI_QUESTIONS_PER_BATCH:
+            errors.append({"row": idx + 1, "error": f"Batch limit {_MAX_AI_QUESTIONS_PER_BATCH} reached"})
+            break
+        try:
+            q, status, dup_of = _save_canonical_to_db(
+                canon, user_id, defaults, skip_duplicates=skip_dup
+            )
+            if status == "created" and q:
+                created.append(q.id)
+                if canon.needs_review:
+                    needs_review_list.append(q.id)
+                preview.append({"row": idx + 1, "status": "created", "question_id": q.id, "qid": canon.qid})
+            elif status == "duplicate":
+                duplicates.append(q.id if q else 0)
+                preview.append({"row": idx + 1, "status": "duplicate", "question_id": q.id if q else None, "duplicate_of": dup_of, "qid": canon.qid})
+            else:
+                errors.append({"row": idx + 1, "error": "save failed"})
+        except Exception as e:
+            logger.exception(f"AI import row {idx} failed")
+            errors.append({"row": idx + 1, "error": str(e)[:200]})
+
+    # Commit
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        logger.exception("AI import commit failed")
+        return {
+            "message": "AI Import commit failed",
+            "total_blocks_found": len(canonical_questions),
+            "questions_created": 0,
+            "duplicates_found": 0,
+            "needs_review": 0,
+            "errors": errors + [{"row": 0, "error": "transaction rollback"}],
+            "success_count": 0,
+            "error_count": len(errors) + 1,
+        }
+
+    # Update job
+    if k_job:
+        try:
+            k_job.status = "completed" if (created or duplicates) else "failed"
+            k_job.questions_created = len(created)
+            k_job.duplicates_found = len(duplicates)
+            k_job.needs_review = len(needs_review_list)
+            k_job.errors_count = len(errors)
+            k_job.errors_json = json.dumps(errors[:_MAX_ERRORS_STORED], ensure_ascii=False)
+            k_job.preview_json = json.dumps(preview[:50], ensure_ascii=False)
+            k_job.completed_at = _utcnow()
+            db.session.add(k_job)
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+    return {
+        "message": f"AI Engine: {len(created)} created, {len(duplicates)} duplicates merged, {len(needs_review_list)} needs review",
+        "knowledge_job": k_job.to_dict() if k_job else None,
+        "total_blocks_found": len(canonical_questions),
+        "questions_created": len(created),
+        "duplicates_found": len(duplicates),
+        "needs_review": len(needs_review_list),
+        "created_ids": created,
+        "duplicate_ids": duplicates,
+        "needs_review_ids": needs_review_list,
+        "errors": errors,
+        "success_count": len(created),
+        "error_count": len(errors),
+        "duplicate_count": len(duplicates),
+        "preview": preview[:100],
+    }
+
+
+# ----- NEW: AI Knowledge Engine Routes -----
+
+@imports_bp.post("/questions/ai")
+@roles_required("admin")
+def import_questions_ai():
+    """
+    AI Knowledge Engine - Accepts ANY educational content
+    Body: { raw_text, source_book, exam_name, exam_year, source_type, marks, negative_marks, skip_duplicates, preview }
+    Supports: Pinnacle books, Kiran, Lucent, Testbook PDFs (OCR'd text), Adda247 screenshots (OCR'd), typed text, broken OCR, mixed Hindi-English
+    """
+    from app.services.feature_flags import is_enabled
+
+    if not is_enabled("ENABLE_IMPORT", True):
+        return jsonify({"error": "Import feature is disabled"}), 403
+
+    if not KNOWLEDGE_ENGINE_AVAILABLE or not knowledge_engine:
+        return jsonify({"error": "Knowledge Engine not available - check server logs"}), 500
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+
+    raw_text = data.get("raw_text") or data.get("content") or data.get("text") or ""
+    if isinstance(raw_text, dict):
+        # Might be questions array already
+        raw_text = json.dumps(raw_text, ensure_ascii=False)
+
+    if not raw_text or not str(raw_text).strip():
+        # Support legacy: questions array? Convert to raw text blocks
+        rows = data.get("questions") or data.get("items") or []
+        if rows and isinstance(rows, list):
+            # If already structured, use old path but via knowledge engine
+            raw_text = "\n\n".join([
+                f"Q. {r.get('question_text','')}\nA) {r.get('option_a','')}\nB) {r.get('option_b','')}\nC) {r.get('option_c','')}\nD) {r.get('option_d','')}\nAnswer: {r.get('correct_answer','')}"
+                for r in rows[:500]
+            ])
+        else:
+            return jsonify({"error": "raw_text or content field required - paste any educational content"}), 400
+
+    if len(raw_text) > _MAX_AI_TEXT_BYTES:
+        return jsonify({"error": f"Text too large - max {_MAX_AI_TEXT_BYTES} bytes"}), 413
+
+    # Source metadata - never hallucinate, keep null if missing
+    defaults = {
+        "source_book": _clip(data.get("source_book") or data.get("book"), 255),
+        "exam_name": _clip(data.get("exam_name") or data.get("exam"), 255),
+        "exam_year": _safe_int(data.get("exam_year") or data.get("year")),
+        "exam": data.get("exam") or data.get("exam_name"),
+        "subject_id": _safe_int(data.get("subject_id")),
+        "chapter_id": _safe_int(data.get("chapter_id")),
+        "bank_id": _safe_int(data.get("bank_id")),
+        "exam_id": _safe_int(data.get("exam_id")),
+        "marks": _safe_float(data.get("marks"), 2.0),
+        "negative_marks": _safe_float(data.get("negative_marks"), 0.5),
+        "skip_duplicates": bool(data.get("skip_duplicates", True)),
+        "auto_create": bool(data.get("auto_create", True)),
+    }
+
+    # Resolve exam_id from name if needed
+    batch_exam = _resolve_exam_id({}, defaults)
+    if batch_exam and not defaults.get("exam_id"):
+        defaults["exam_id"] = batch_exam
+
+    dry_run = bool(data.get("preview") or data.get("dry_run") or data.get("is_preview"))
+
+    try:
+        # Layer 1-6 via pipeline
+        canonical_list = knowledge_engine.process_document(
+            content=str(raw_text),
+            source_meta={
+                "source_book": defaults.get("source_book"),
+                "source_type": data.get("source_type", "typed"),
+                "exam_name": defaults.get("exam_name"),
+                "exam_year": defaults.get("exam_year"),
+                "file_name": defaults.get("source_book") or "raw_text_input",
+                "marks": defaults.get("marks"),
+                "negative_marks": defaults.get("negative_marks"),
+            }
+        )
+    except Exception as e:
+        logger.exception("Knowledge Engine process_document failed")
+        return jsonify({"error": f"AI Engine failed: {str(e)[:300]}"}), 500
+
+    if not canonical_list:
+        return jsonify({
+            "message": "No question blocks detected - check input format",
+            "total_blocks_found": 0,
+            "questions_created": 0,
+            "duplicates_found": 0,
+            "needs_review": 0,
+            "questions": [],
+        }), 200
+
+    # If preview only, don't save
+    if dry_run:
+        result = _run_ai_import(
+            canonical_list,
+            _identity_int(),
+            defaults,
+            source_type=data.get("source_type", "typed"),
+            file_name=defaults.get("source_book") or "preview",
+            dry_run=True,
+        )
+        return jsonify(result), 200
+
+    result = _run_ai_import(
+        canonical_list,
+        _identity_int(),
+        defaults,
+        source_type=data.get("source_type", "typed"),
+        file_name=defaults.get("source_book") or "ai_text_import",
+        dry_run=False,
+    )
+
+    # Return in requested format - full knowledge objects + frontend compatible
+    # Include questions with full details for frontend preview
+    full_result = {
+        **result,
+        "questions": [c.to_full_knowledge_object() for c in canonical_list[:100]],  # limit response
+    }
+
+    code = 201 if result.get("questions_created") or result.get("duplicates_found") else 400
+    return jsonify(full_result), code
+
+
+@imports_bp.post("/questions/ai/file")
+@roles_required("admin")
+def import_questions_ai_file():
+    """
+    AI Engine File Import - Accepts ANY file type
+    PDF, image, screenshot, DOCX, CSV, JSON, HTML, MD, TXT, mixed Hindi-English, broken OCR
+    FormData: file, source_book, exam_name, exam_year, source_type, preview
+    """
+    from app.services.feature_flags import is_enabled
+
+    if not is_enabled("ENABLE_IMPORT", True):
+        return jsonify({"error": "Import feature is disabled"}), 403
+
+    if not KNOWLEDGE_ENGINE_AVAILABLE or not knowledge_engine:
+        return jsonify({"error": "Knowledge Engine not available"}), 500
+
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "file required - upload PDF, DOCX, image, CSV, JSON, TXT, MD"}), 400
+
+    raw_bytes = f.read(_MAX_AI_FILE_BYTES + 1)
+    if len(raw_bytes) > _MAX_AI_FILE_BYTES:
+        return jsonify({"error": f"File too large - max {_MAX_AI_FILE_BYTES} bytes"}), 413
+
+    filename = getattr(f, "filename", "upload") or "upload"
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "txt"
+
+    # Layer 1: INTAKE - extract text from any format
+    try:
+        extracted_text = _extract_text_from_file(raw_bytes, filename, ext)
+    except Exception as e:
+        logger.exception(f"File text extraction failed for {filename}")
+        return jsonify({"error": f"Could not extract text from file: {str(e)[:200]}"}), 400
+
+    if not extracted_text or len(extracted_text.strip()) < 20:
+        return jsonify({
+            "error": "File seems empty or OCR failed. For scanned PDFs/images, ensure OCR dependencies (pytesseract, Pillow) are installed on server.",
+            "filename": filename,
+            "extracted_len": len(extracted_text) if extracted_text else 0,
+        }), 400
+
+    defaults = {
+        "source_book": _clip(request.form.get("source_book") or filename, 255),
+        "exam_name": _clip(request.form.get("exam_name") or request.form.get("exam"), 255),
+        "exam_year": _safe_int(request.form.get("exam_year") or request.form.get("year")),
+        "exam": request.form.get("exam") or request.form.get("exam_name"),
+        "subject_id": request.form.get("subject_id", type=int),
+        "chapter_id": request.form.get("chapter_id", type=int),
+        "bank_id": request.form.get("bank_id", type=int),
+        "exam_id": request.form.get("exam_id", type=int),
+        "marks": request.form.get("marks", type=float) or 2.0,
+        "negative_marks": request.form.get("negative_marks", type=float) or 0.5,
+        "skip_duplicates": request.form.get("skip_duplicates", "true").lower() != "false",
+        "auto_create": request.form.get("auto_create", "true").lower() != "false",
+    }
+
+    batch_exam = _resolve_exam_id({}, defaults)
+    if batch_exam and not defaults.get("exam_id"):
+        defaults["exam_id"] = batch_exam
+
+    dry_run = request.form.get("preview", "false").lower() in ("1", "true", "yes")
+
+    try:
+        canonical_list = knowledge_engine.process_document(
+            content=extracted_text,
+            source_meta={
+                "source_book": defaults.get("source_book"),
+                "source_type": request.form.get("source_type", ext if ext in ("pdf","docx","csv","json") else "file"),
+                "exam_name": defaults.get("exam_name"),
+                "exam_year": defaults.get("exam_year"),
+                "file_name": filename,
+                "marks": defaults.get("marks"),
+                "negative_marks": defaults.get("negative_marks"),
+            },
+            file_type=ext,
+        )
+    except Exception as e:
+        logger.exception("Knowledge Engine file processing failed")
+        return jsonify({"error": f"AI Engine failed: {str(e)[:300]}"}), 500
+
+    if not canonical_list:
+        return jsonify({
+            "message": "No question blocks detected in file",
+            "filename": filename,
+            "extracted_preview": extracted_text[:1000],
+            "total_blocks_found": 0,
+            "questions_created": 0,
+            "duplicates_found": 0,
+            "needs_review": 0,
+        }), 200
+
+    result = _run_ai_import(
+        canonical_list,
+        _identity_int(),
+        defaults,
+        source_type=request.form.get("source_type", ext),
+        file_name=filename,
+        dry_run=dry_run,
+    )
+
+    result["filename"] = filename
+    result["extracted_preview"] = extracted_text[:2000]
+    result["questions"] = [c.to_full_knowledge_object() for c in canonical_list[:100]]
+
+    code = 200 if dry_run else (201 if result.get("questions_created") or result.get("duplicates_found") else 400)
+    return jsonify(result), code
+
+
+@imports_bp.post("/questions/ai/preview")
+@roles_required("admin")
+def preview_questions_ai():
+    """
+    Preview without saving - validates and shows how AI parses content
+    """
+    data = request.get_json(silent=True) or {}
+    data["preview"] = True
+    # Reuse ai endpoint logic with dry_run
+    return import_questions_ai()
+
+
+@imports_bp.get("/knowledge/jobs")
+@roles_required("admin")
+def list_knowledge_jobs():
+    if not KnowledgeIngestionJob:
+        return jsonify({"items": [], "total": 0})
+    jobs = KnowledgeIngestionJob.query.order_by(KnowledgeIngestionJob.id.desc()).limit(100).all()
+    return jsonify({"items": [j.to_dict() for j in jobs], "total": len(jobs)})
+
+
+@imports_bp.get("/knowledge/jobs/<int:job_id>")
+@roles_required("admin")
+def get_knowledge_job(job_id):
+    if not KnowledgeIngestionJob:
+        return jsonify({"error": "Knowledge Engine not available"}), 500
+    job = KnowledgeIngestionJob.query.get_or_404(job_id)
+    return jsonify(job.to_dict())
+
+
+@imports_bp.get("/knowledge/question/<int:question_id>/appearances")
+@roles_required("admin")
+def get_question_appearances(question_id):
+    if not QuestionAppearance:
+        return jsonify({"items": [], "total": 0})
+    q = Question.query.get_or_404(question_id)
+    apps = QuestionAppearance.query.filter_by(question_id=q.id).order_by(QuestionAppearance.created_at.desc()).all()
+    return jsonify({
+        "question_id": question_id,
+        "qid": getattr(q, 'qid', None),
+        "items": [a.to_dict() for a in apps],
+        "total": len(apps),
+    })
+
+
+@imports_bp.post("/knowledge/reindex")
+@roles_required("admin")
+def reindex_knowledge_search():
+    """
+    Placeholder for future vector reindex - currently just returns stats
+    """
+    total_q = Question.query.count()
+    total_appearances = QuestionAppearance.query.count() if QuestionAppearance else 0
+    needs_review = 0
+    try:
+        needs_review = Question.query.filter_by(needs_review=True).count()
+    except Exception:
+        pass
+    return jsonify({
+        "message": "Knowledge Bank stats",
+        "total_questions": total_q,
+        "total_appearances": total_appearances,
+        "needs_review": needs_review,
+        "engine_version": knowledge_engine.version if knowledge_engine else "unavailable",
+    })
+

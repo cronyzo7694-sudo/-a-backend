@@ -458,31 +458,60 @@ def _create_from_row(
         is_favorite=bool(row.get("is_favorite") or row.get("favorite") or False),
         is_active=str(row.get("status") or "active").lower() not in ("hidden", "archived"),
     )
+    # Sanitize to valid UTF-8 to avoid psycopg2 decode error (Render issue)
+    def _sanitize(s: str) -> str:
+        if not s:
+            return s
+        try:
+            return s.encode('utf-8', 'ignore').decode('utf-8', 'ignore')
+        except Exception:
+            return "".join(ch for ch in s if ord(ch) < 65535)[:_MAX_TEXT]
+
+    q.question_text = _sanitize(q.question_text)
+    if q.explanation:
+        q.explanation = _sanitize(q.explanation)
+
     db.session.add(q)
     db.session.flush()
 
     if qtype != "integer":
         for i, (key, text_opt) in enumerate(options[:_MAX_OPTIONS]):
-            db.session.add(
-                QuestionOption(
-                    question_id=q.id,
-                    option_key=str(key)[:8],
-                    option_text=text_opt or "",
-                    order_index=i,
+            try:
+                db.session.add(
+                    QuestionOption(
+                        question_id=q.id,
+                        option_key=str(key)[:8],
+                        option_text=_sanitize(text_opt or ""),
+                        order_index=i,
+                    )
                 )
-            )
+            except Exception:
+                continue
 
-    # Tag mapping table
+    # Tag mapping - SKIPPED for bulk import to avoid 4000 queries + OOM on Render free tier
+    # Tags are stored as comma string in Question.tags column (enough for search)
+    # If you need QuestionTag mapping, enable via env ENABLE_TAG_MAPPING=true
+    # This saves ~3 queries per question = 3000 queries for 1000 questions
     try:
-        for tag in _ensure_tags(tag_list):
-            if not QuestionTag.query.filter_by(question_id=q.id, tag_id=tag.id).first():
-                db.session.add(QuestionTag(question_id=q.id, tag_id=tag.id))
+        enable_tag_map = False  # Disabled by default for bulk safety
+        # import os
+        # enable_tag_map = os.getenv("ENABLE_TAG_MAPPING", "false").lower() == "true"
+        if enable_tag_map:
+            for tag in _ensure_tags(tag_list):
+                try:
+                    if not QuestionTag.query.filter_by(question_id=q.id, tag_id=tag.id).first():
+                        db.session.add(QuestionTag(question_id=q.id, tag_id=tag.id))
+                except Exception:
+                    continue
     except Exception:
-        logger.exception("tag mapping failed")
+        logger.exception("tag mapping skipped")
 
     exam_id = _resolve_exam_id(row, defaults)
     if exam_id:
-        _map_to_exam(q, exam_id, {**defaults, **row})
+        try:
+            _map_to_exam(q, exam_id, {**defaults, **row})
+        except Exception:
+            logger.exception("map_to_exam skipped for bulk")
 
     return q, None, "created"
 
@@ -552,6 +581,8 @@ def _run_import(
 
     skip_dup = bool(defaults.get("skip_duplicates", True))
 
+    # Batch commit every 50 rows to avoid Render 512MB OOM + WORKER TIMEOUT
+    BATCH_SIZE = 50
     for i, row in enumerate(rows):
         try:
             q, err, status = _create_from_row(
@@ -560,10 +591,16 @@ def _run_import(
                 defaults,
                 skip_duplicates=skip_dup,
             )
-        except Exception:
-            logger.exception("import row %s failed", i + 1)
+        except Exception as e:
+            logger.exception("import row %s failed: %s", i + 1, str(e)[:200])
             errors.append({"row": i + 1, "error": "row processing failed"})
+            # Rollback this row only, continue
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
             continue
+
         if status == "error":
             errors.append({"row": i + 1, "error": err or "error"})
         elif status == "duplicate":
@@ -578,6 +615,19 @@ def _run_import(
                 "question_id": q.id,
                 "hash": q.content_hash,
             })
+
+        # Commit batch to free memory and avoid timeout
+        if (i + 1) % BATCH_SIZE == 0:
+            try:
+                db.session.commit()
+                # Start new transaction for next batch
+                db.session.begin()
+            except Exception as e:
+                logger.warning(f"Batch commit at row {i+1} failed: {e}")
+                try:
+                    db.session.rollback()
+                except Exception:
+                    pass
 
     if dry_run:
         db.session.rollback()

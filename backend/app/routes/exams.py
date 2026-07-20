@@ -532,75 +532,225 @@ def unpublish_exam(exam_id):
 # - Optimistic locking when publishing concurrent edits
 # --------------------------------------------
 
-# FILE-BASED EXAM - Code ke sath question file daalo, test ban jayega
+# FILE-BASED REAL TEST SYSTEM - Chapter wise, Topic wise, Subject wise, Full Mock
+# Put file in questions_data folder, create test like real SSC exam
+
+@exams_bp.get("/file-bank/stats")
+@jwt_required()
+def file_bank_stats():
+    try:
+        from app.services.file_bank import get_stats, FILE_QUESTIONS
+        stats = get_stats()
+        return jsonify({
+            "message": "File bank stats - real test jaisa",
+            "total_file_questions": len(FILE_QUESTIONS),
+            "stats": stats,
+            "available_test_types": ["chapter_wise", "topic_wise", "subject_wise", "full_mock", "pyq", "difficulty_wise", "random"],
+            "example": {
+                "chapter_wise": "Analogy chapter ke 20 questions ka test",
+                "topic_wise": "Number Analogy topic ke 15 questions",
+                "subject_wise": "Reasoning subject ke 50 questions",
+                "full_mock": "Full 100 questions mock like real SSC"
+            }
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 500
+
+@exams_bp.get("/file-bank/questions")
+@jwt_required()
+def file_bank_questions():
+    try:
+        from app.services.file_bank import FILE_QUESTIONS
+        # Query params: subject, chapter, topic, difficulty, count
+        subject = request.args.get("subject")
+        chapter = request.args.get("chapter")
+        topic = request.args.get("topic")
+        difficulty = request.args.get("difficulty")
+        count = int(request.args.get("count", 20))
+        count = min(count, 100)  # Max 100 per preview
+        
+        from app.services.file_bank import filter_questions
+        filtered = filter_questions(subject=subject, chapter=chapter, topic=topic, difficulty=difficulty, count=count)
+        
+        return jsonify({
+            "total_in_file_bank": len(FILE_QUESTIONS),
+            "filtered_count": len(filtered),
+            "filters": {"subject": subject, "chapter": chapter, "topic": topic, "difficulty": difficulty, "count": count},
+            "questions": filtered[:count]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)[:500]}), 500
+
 @exams_bp.post("/import-from-files")
 @roles_required("admin")
 def import_from_files():
+    """
+    Real test jaisa - Chapter wise, Topic wise, Subject wise, Full Mock
+    Body: {
+      "test_type": "chapter_wise" | "topic_wise" | "subject_wise" | "full_mock" | "random",
+      "subject": "Reasoning",
+      "chapter": "Analogy",
+      "topic": "Number Analogy",  # optional - Number Analogy, Word Analogy, etc
+      "difficulty": "easy" | "medium" | "hard" | null,
+      "count": 20,
+      "title": "Custom Test Name"
+    }
+    """
     try:
-        from app.services.file_bank import FILE_QUESTIONS
-        if not FILE_QUESTIONS:
-            return jsonify({"error": "questions_data folder me koi txt file nahi mili"}), 404
+        from app.services.file_bank import FILE_QUESTIONS, filter_questions, get_stats
         
-        # Ek naya exam banao file wale questions se
+        data = request.get_json(silent=True) or {}
+        
+        if not FILE_QUESTIONS:
+            return jsonify({"error": "questions_data folder me koi txt file nahi mili. Folder: backend/questions_data/ me .txt file daalo"}), 404
+        
+        test_type = data.get("test_type", "chapter_wise")
+        subject = data.get("subject")
+        chapter = data.get("chapter", "Analogy")
+        topic = data.get("topic")  # e.g., Number Analogy, Word Analogy, SI Units
+        difficulty = data.get("difficulty")
+        count = int(data.get("count", 20))
+        count = max(5, min(count, 100))  # Real test: 20-25 questions per chapter, 100 for full mock
+        title = data.get("title")
+        
+        # Filter questions based on real test logic
+        if test_type == "chapter_wise":
+            # e.g., chapter=Analogy, count=20
+            filtered = filter_questions(chapter=chapter or "Analogy", difficulty=difficulty, count=count)
+            if not title:
+                title = f"{chapter or 'Analogy'} - Chapter Test - {len(filtered)} Qs"
+            desc = f"Chapter wise test: {chapter or 'Analogy'} - {len(filtered)} questions from file bank"
+        
+        elif test_type == "topic_wise":
+            # e.g., topic=Number Analogy, count=15
+            filtered = filter_questions(topic=topic or "Number Analogy", difficulty=difficulty, count=count)
+            if not title:
+                title = f"{topic or 'Number Analogy'} - Topic Test - {len(filtered)} Qs"
+            desc = f"Topic wise test: {topic} - focused practice"
+        
+        elif test_type == "subject_wise":
+            filtered = filter_questions(subject=subject or "Reasoning", difficulty=difficulty, count=count)
+            if not title:
+                title = f"{subject or 'Reasoning'} - Subject Test - {len(filtered)} Qs"
+            desc = f"Subject wise test: {subject}"
+        
+        elif test_type == "full_mock":
+            # Full mock: mix of all topics, 100 questions like real SSC
+            filtered = filter_questions(count=count)
+            if not title:
+                title = f"Full Mock Test - {len(filtered)} Qs - Real Exam Pattern"
+            desc = f"Full mock like real SSC - {len(filtered)} questions mixed"
+        
+        elif test_type == "difficulty_wise":
+            filtered = filter_questions(difficulty=difficulty or "medium", count=count)
+            if not title:
+                title = f"{(difficulty or 'medium').title()} Level Test - {len(filtered)} Qs"
+            desc = f"Difficulty wise: {difficulty}"
+        
+        else:  # random
+            filtered = filter_questions(subject=subject, chapter=chapter, topic=topic, difficulty=difficulty, count=count)
+            if not title:
+                title = f"Practice Test - {len(filtered)} Qs"
+            desc = f"Practice test from file bank - {len(filtered)} Qs"
+        
+        if not filtered:
+            stats = get_stats()
+            return jsonify({
+                "error": f"No questions found for filters",
+                "filters": {"test_type": test_type, "subject": subject, "chapter": chapter, "topic": topic, "difficulty": difficulty},
+                "available": stats,
+                "hint": "Try topic='Number Analogy' or chapter='Analogy' or no filters for random"
+            }), 404
+        
+        # Create real exam like SSC pattern
         exam = Exam(
-            title=f"File Based Test - {len(FILE_QUESTIONS)} Questions",
-            description=f"Auto created from {len(FILE_QUESTIONS)} file questions",
-            duration_seconds=3600,
+            title=title[:255],
+            description=desc[:1000],
+            duration_seconds=count * 60,  # 1 min per question like real exam
             status="published",
-            exam_mode="mock"
+            exam_mode="mock",
+            default_marks=2,
+            default_negative_marks=0.5
         )
         db.session.add(exam)
         db.session.flush()
         
-        # Ek section banao
+        # Create section
         section = ExamSection(
             exam_id=exam.id,
-            title="General",
+            title=chapter or topic or subject or "General",
             order_index=0
         )
         db.session.add(section)
         db.session.flush()
         
-        # File ke questions ko DB questions banao + exam me add karo
-        count = 0
-        for fq in FILE_QUESTIONS[:500]:  # Pehle 500 le, 2 lakh nahi ek saath
+        # Add questions to DB and exam
+        added = 0
+        for idx, fq in enumerate(filtered):
             try:
                 q = Question(
                     question_text=fq["question_text"][:2000],
                     question_type="single_choice",
-                    difficulty="medium",
-                    correct_answer="A",
+                    difficulty=fq.get("difficulty","medium") if fq.get("difficulty") in ["easy","medium","hard"] else "medium",
+                    correct_answer="A",  # Default, will be reviewed
                     marks=2,
-                    is_active=True
+                    negative_marks=0.5,
+                    is_active=True,
+                    tags=f"{fq.get('subject','')},{fq.get('chapter','')},{fq.get('topic','')},{fq.get('pattern','')}"[:512],
+                    source=fq.get("source","file_bank")
                 )
                 db.session.add(q)
                 db.session.flush()
                 
-                # Options
                 from app.models.question import QuestionOption
-                for idx, opt in enumerate(fq.get("options", [])[:4]):
+                for opt_idx, opt in enumerate(fq.get("options", [])[:4]):
                     db.session.add(QuestionOption(
                         question_id=q.id,
                         option_key=opt.get("option_key","A"),
                         option_text=opt.get("option_text","")[:500],
-                        order_index=idx
+                        order_index=opt_idx
                     ))
                 
-                # Exam me add
                 db.session.add(ExamQuestion(
                     exam_id=exam.id,
                     section_id=section.id,
                     question_id=q.id,
-                    order_index=count,
-                    marks=2
+                    order_index=added,
+                    marks=2,
+                    negative_marks=0.5
                 ))
-                count += 1
-            except Exception:
+                added += 1
+                
+                # Commit every 20 to avoid memory
+                if added % 20 == 0:
+                    try:
+                        db.session.commit()
+                        db.session.begin()
+                    except Exception:
+                        db.session.rollback()
+                        db.session.begin()
+                        
+            except Exception as e:
+                logger.warning(f"Failed to add file question {idx}: {e}")
                 continue
         
-        db.session.commit()
-        return jsonify({"message": f"File se {count} questions ka test ban gaya", "exam_id": exam.id, "exam": exam.to_dict()}), 201
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            return jsonify({"error": "Failed to save exam"}), 500
+        
+        return jsonify({
+            "message": f"Real test jaisa ban gaya! {added} questions - {test_type}",
+            "exam_id": exam.id,
+            "exam": exam.to_dict(),
+            "test_type": test_type,
+            "filters_used": {"subject": subject, "chapter": chapter, "topic": topic, "difficulty": difficulty, "count": count},
+            "questions_added": added,
+            "stats": get_stats()
+        }), 201
         
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": str(e)[:500]}), 500
+        logger.exception("import_from_files failed")
+        return jsonify({"error": str(e)[:800]}), 500

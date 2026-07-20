@@ -54,7 +54,10 @@ _DEFAULT_CORS: Final[str] = (
     "https://exam-os-frontend-azure.vercel.app,"
     "https://exam-os-frontend.vercel.app,"
     "https://exam-os-frontend-lxem7xtya-cronyzo.vercel.app,"
-    "https://exam-os-frontend-4kit4s83e-cronyzo.vercel.app"
+    "https://exam-os-frontend-4kit4s83e-cronyzo.vercel.app,"
+    "https://pariksha.cronyzo7694.workers.dev,"
+    "https://exam-os-frontend-azure.vercel.app,"
+    "https://exam-os-frontend.pages.dev"
 )
 _DEFAULT_MAX_UPLOAD_BYTES: Final[int] = 16 * 1024 * 1024  # 16 MiB
 _MIN_UPLOAD_BYTES: Final[int] = 1024  # 1 KiB floor — reject absurd zeros
@@ -218,6 +221,8 @@ def _parse_cors_origins(raw: Optional[str]) -> List[str]:
     for origin in (
         "https://exam-os-frontend-azure.vercel.app",
         "https://exam-os-frontend.vercel.app",
+        "https://pariksha.cronyzo7694.workers.dev",
+        "https://exam-os-frontend-azure.vercel.app",
     ):
         if origin not in seen:
             seen.add(origin.lower())

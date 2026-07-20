@@ -99,8 +99,22 @@ class Exam(db.Model):
     created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow, nullable=False)
 
+    parent_exam_id = db.Column(
+        db.Integer,
+        db.ForeignKey("exams.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    parent_exam = db.relationship(
+        "Exam",
+        remote_side=[id],
+        foreign_keys=[parent_exam_id],
+        backref=db.backref("children", lazy="select"),
+    )
+
     # --------------------------------------------
     # EXTENSION POINT: Add language pack, certificate template, proctoring flags
+    # --------------------------------------------
     # --------------------------------------------
 
     sections = db.relationship(
@@ -157,6 +171,7 @@ class Exam(db.Model):
         self,
         include_sections: bool = True,
         include_questions: bool = False,
+        include_children: bool = False,
     ) -> Dict[str, Any]:
         data: Dict[str, Any] = {
             "id": self.id,
@@ -186,6 +201,7 @@ class Exam(db.Model):
             "ends_at": _iso(self.ends_at),
             "created_at": _iso(self.created_at),
             "updated_at": _iso(self.updated_at),
+            "parent_exam_id": self.parent_exam_id,
         }
         if include_sections:
             try:
@@ -194,6 +210,14 @@ class Exam(db.Model):
                 sections = []
             data["sections"] = [
                 s.to_dict(include_questions=include_questions) for s in sections
+            ]
+        if include_children:
+            try:
+                children = list(self.children or [])
+            except Exception:  # noqa: BLE001
+                children = []
+            data["children"] = [
+                c.to_dict(include_sections=True, include_children=False) for c in children
             ]
         return data
 

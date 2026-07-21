@@ -462,8 +462,11 @@ def start_attempt():
         except (TypeError, ValueError):
             pass
 
+    # Use the validated integer exam id (never rely on a possibly-expired ORM
+    # attribute after intermediate queries/flushes -> avoids exam_id NULL crash)
+    safe_exam_id = exam_id_i or exam.id
     attempt = Attempt(
-        exam_id=exam.id,
+        exam_id=safe_exam_id,
         user_id=user_id,
         status="in_progress",
         started_at=now,
@@ -472,6 +475,8 @@ def start_attempt():
         total_questions=selected_count or exam.total_questions,
         max_score=selected_marks or exam.total_marks,
     )
+    if attempt.exam_id is None:
+        return jsonify({"error": "Exam reference lost, please retry"}), 400
     db.session.add(attempt)
     db.session.flush()
 

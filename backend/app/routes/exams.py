@@ -609,11 +609,13 @@ def cleanup_auto_tests():
                 rules = ex.get_rules() or {}
             except Exception:
                 rules = {}
-            # Only remove standalone auto-generated pool tests, NOT containers
-            # and NOT manually-created exams.
-            is_auto = bool(rules.get("auto_generated"))
             is_container = bool(rules.get("auto_container"))
-            if is_auto and not is_container:
+            # A file-bank test has either an auto_generated tag OR a
+            # file_bank_source config (older tests). Remove those top-level ones
+            # so they can be regenerated inside a subject container. Keep
+            # containers and genuinely-manual exams.
+            is_file_bank_test = bool(rules.get("auto_generated")) or bool(rules.get("file_bank_source"))
+            if is_file_bank_test and not is_container:
                 removed.append({"exam_id": ex.id, "title": ex.title})
                 db.session.delete(ex)
         db.session.commit()

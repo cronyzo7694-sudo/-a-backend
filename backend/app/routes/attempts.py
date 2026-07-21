@@ -439,6 +439,15 @@ def start_attempt():
             return jsonify(_build_player_payload(existing, exam))
 
     now = _utcnow()
+
+    # A commit/rollback above (resume / auto-expire path) can expire or detach
+    # the `exam` ORM object. Re-fetch it fresh so every attribute below (id,
+    # totals, duration) is reliably populated -> fixes exam_id NULL on insert.
+    exam = Exam.query.get(exam_id_i)
+    if exam is None:
+        return jsonify({"error": "Exam not found"}), 404
+
+    rules = ExamRuleEngine.from_exam(exam)
     duration = int(rules.overall_seconds() or exam.duration_seconds or 3600)
     if duration < 1:
         duration = 3600

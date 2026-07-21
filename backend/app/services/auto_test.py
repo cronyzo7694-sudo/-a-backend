@@ -362,14 +362,24 @@ def generate_tests_for_exam(exam: Exam) -> Dict:
 
             chapter_covered[chapter] = bool(chapter_qcount > 0 and (chapter_made or topic_made_any))
 
-        # subject test ONLY when ALL chapters of this subject are covered
+        # Subject test rule: bahut se chapters mil ke subject banta hai.
+        # Make a subject test only when ALL syllabus chapters of this subject
+        # are covered AND there are at least 2 covered chapters (ek akela chapter
+        # -> sirf chapter test, subject test nahi).
+        covered_count = sum(1 for ch in chapters if chapter_covered.get(ch, False))
         all_ch_covered = len(chapters) > 0 and all(chapter_covered.get(ch, False) for ch in chapters)
-        subject_fully_covered[subject] = all_ch_covered
-        if all_ch_covered:
+        make_subject = all_ch_covered and covered_count >= 2
+        subject_fully_covered[subject] = make_subject
+        if make_subject:
             _try("subject_wise", subject, None, None, f"{subject} - Subject Test")
 
-    # full test ONLY when ALL exam subjects are fully covered
-    full_ready = len(want_subjects) > 0 and all(subject_fully_covered.get(s, False) for s in want_subjects)
+    # Full test: saare subjects mil ke full paper. Only when EVERY exam subject
+    # is fully covered AND the exam actually has 2+ subjects (warna ye chapter/
+    # subject test jaisa hi ho jaayega).
+    full_ready = (
+        len(want_subjects) >= 2
+        and all(subject_fully_covered.get(s, False) for s in want_subjects)
+    )
     if full_ready:
         _try("full_mock", None, None, None, f"{exam.title} - Full Test")
 

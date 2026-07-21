@@ -159,8 +159,16 @@ def get_exam(exam_id):
             for c in children:
                 cd = c.to_dict(include_sections=False)
                 try:
-                    ccs = (c.get_rules() or {}).get("coming_soon") or {}
+                    crules = c.get_rules() or {}
+                    ccs = crules.get("coming_soon") or {}
                     cd["coming_soon"] = bool(ccs.get("active"))
+                    # Show the REAL per-attempt question count (what a student
+                    # actually sees), not the whole shared pool size.
+                    fb = crules.get("file_bank_source") or {}
+                    qpa = fb.get("questions_per_attempt")
+                    if qpa:
+                        cd["questions_per_attempt"] = int(qpa)
+                        cd["total_questions"] = int(qpa)
                 except Exception:
                     cd["coming_soon"] = False
                 child_list.append(cd)

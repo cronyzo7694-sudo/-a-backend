@@ -3,6 +3,7 @@ Free AI Chain - DeepSeek + Gemini + ChatGPT (via OpenRouter/Groq) - All Free Tie
 Paisa zero, kaam kadak. Fallback chain: Gemini -> DeepSeek -> OpenRouter Free -> Local heuristic
 """
 import os
+import re
 import json
 import logging
 import requests
@@ -226,3 +227,142 @@ def ensemble_classify(question_text: str, local_fn=None) -> Dict:
             return v
     
     return votes[0]
+
+
+# ===========================================================================
+# ANSWER + EXPLANATION derivation
+# Used ONLY when the source file has no answer key. File answer always wins.
+# ===========================================================================
+def _build_answer_prompt(question_text, options):
+    opt_lines = "\n".join(
+        f"{o.get('option_key','?')}) {o.get('option_text','')}" for o in (options or [])
+    )
+    return (
+        "You are an expert exam solver. Solve this multiple-choice question and "
+        "give the single correct option key.\n\n"
+        f"Question: {question_text[:1200]}\n\nOptions:\n{opt_lines}\n\n"
+        "Return ONLY JSON: {\"correct_answer\":\"A|B|C|D\",\"explanation\":\"1-3 line reason\"}\n"
+        "The correct_answer MUST be one of the given option keys. Only JSON."
+    )
+
+
+def _gemini_answer(question_text, options):
+    if not GEMINI_API_KEY:
+        return None
+    try:
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}")
+        payload = {"contents": [{"parts": [{"text": _build_answer_prompt(question_text, options)}]}]}
+        resp = requests.post(url, json=payload, timeout=20)
+        if resp.status_code == 200:
+            text = (resp.json().get("candidates", [{}])[0]
+                    .get("content", {}).get("parts", [{}])[0].get("text", ""))
+            if "{" in text:
+                return json.loads(text[text.find("{"):text.rfind("}") + 1])
+    except Exception as e:
+        logger.debug(f"Gemini answer failed: {e}")
+    return None
+
+
+def _groq_answer(question_text, options):
+    if not GROQ_API_KEY:
+        return None
+    try:
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "model": "llama3-8b-8192",
+            "messages": [{"role": "user", "content": _build_answer_prompt(question_text, options)}],
+            "temperature": 0.1, "max_tokens": 400,
+        }
+        resp = requests.post(url, json=payload, headers=headers, timeout=20)
+        if resp.status_code == 200:
+            text = resp.json()["choices"][0]["message"]["content"]
+            if "{" in text:
+                return json.loads(text[text.find("{"):text.rfind("}") + 1])
+    except Exception as e:
+        logger.debug(f"Groq answer failed: {e}")
+    return None
+
+
+def _deepseek_answer(question_text, options):
+    if not DEEPSEEK_API_KEY:
+        return None
+    try:
+        url = "https://api.deepseek.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": _build_answer_prompt(question_text, options)}],
+            "temperature": 0.1, "max_tokens": 400,
+        }
+        resp = requests.post(url, json=payload, headers=headers, timeout=20)
+        if resp.status_code == 200:
+            text = resp.json()["choices"][0]["message"]["content"]
+            if "{" in text:
+                return json.loads(text[text.find("{"):text.rfind("}") + 1])
+    except Exception as e:
+        logger.debug(f"DeepSeek answer failed: {e}")
+    return None
+
+
+def derive_answer_with_ai(question_text, options):
+    """
+    Try to derive correct answer + explanation using the free AI chain.
+    Returns {'correct_answer': 'A'|..., 'explanation': str, 'source': 'ai:<model>'}
+    or None if no key / all failed. NEVER guesses without a model.
+    """
+    if not question_text or len(question_text) < 8 or not options:
+        return None
+    valid_keys = {str(o.get("option_key", "")).upper() for o in options}
+
+    for name, fn in (("gemini", _gemini_answer), ("groq", _groq_answer),
+                     ("deepseek", _deepseek_answer)):
+        res = fn(question_text, options)
+        if res and res.get("correct_answer"):
+            ans = str(res["correct_answer"]).strip().upper()[:4]
+            # keep only first key char if model returns "A) ..." style
+            m = re.match(r"[A-D]", ans)
+            if m:
+                ans = m.group(0)
+            if ans in valid_keys:
+                return {
+                    "correct_answer": ans,
+                    "explanation": str(res.get("explanation", ""))[:800],
+                    "source": f"ai:{name}",
+                }
+    return None
+
+
+def generate_explanation_with_ai(question_text, options, correct_answer):
+    """Generate an explanation for an already-known correct answer (AI writes it)."""
+    if not question_text or not correct_answer:
+        return None
+    opt_lines = "\n".join(
+        f"{o.get('option_key','?')}) {o.get('option_text','')}" for o in (options or [])
+    )
+    prompt = (
+        "Explain briefly (2-4 lines) why the given answer is correct for this MCQ.\n\n"
+        f"Question: {question_text[:1200]}\nOptions:\n{opt_lines}\n"
+        f"Correct answer: {correct_answer}\n\n"
+        "Return ONLY JSON: {\"explanation\":\"...\"}. Only JSON."
+    )
+    for fn in (_gemini_answer, _groq_answer, _deepseek_answer):
+        # reuse the model callers with a tweaked prompt via a small shim
+        pass
+    # Simpler: call gemini directly for explanation
+    if GEMINI_API_KEY:
+        try:
+            url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+                   f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}")
+            payload = {"contents": [{"parts": [{"text": prompt}]}]}
+            resp = requests.post(url, json=payload, timeout=20)
+            if resp.status_code == 200:
+                text = (resp.json().get("candidates", [{}])[0]
+                        .get("content", {}).get("parts", [{}])[0].get("text", ""))
+                if "{" in text:
+                    data = json.loads(text[text.find("{"):text.rfind("}") + 1])
+                    return str(data.get("explanation", ""))[:800] or None
+        except Exception as e:
+            logger.debug(f"Gemini explanation failed: {e}")
+    return None

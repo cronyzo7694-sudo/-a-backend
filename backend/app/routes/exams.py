@@ -606,33 +606,53 @@ def import_from_files():
         
         test_type = data.get("test_type", "chapter_wise")
         subject = data.get("subject")
-        chapter = data.get("chapter", "Analogy")
+        chapter = data.get("chapter")
         topic = data.get("topic")  # e.g., Number Analogy, Word Analogy, SI Units
         difficulty = data.get("difficulty")
-        count = int(data.get("count", 20))
-        count = max(5, min(count, 100))  # Real test: 20-25 questions per chapter, 100 for full mock
         title = data.get("title")
+
+        # Real-paper default counts per test type (used when caller omits count)
+        DEFAULT_COUNTS = {
+            "topic_wise": 12,       # topic test: 10-15 questions
+            "chapter_wise": 20,     # chapter test: ~20-25
+            "subject_wise": 25,     # subject test
+            "full_mock": 100,       # full mock like real SSC
+            "difficulty_wise": 20,
+            "random": 20,
+        }
+        if data.get("count") in (None, "", 0):
+            count = DEFAULT_COUNTS.get(test_type, 20)
+        else:
+            count = int(data.get("count"))
+        # Full mock can be large; others capped to sensible real-paper sizes
+        if test_type == "full_mock":
+            count = max(10, min(count, 200))
+        elif test_type == "topic_wise":
+            count = max(5, min(count, 15))
+        else:
+            count = max(5, min(count, 100))
         
         # Filter questions based on real test logic
         if test_type == "chapter_wise":
-            # e.g., chapter=Analogy, count=20
-            filtered = filter_questions(chapter=chapter or "Analogy", difficulty=difficulty, count=count)
+            filtered = filter_questions(chapter=chapter, difficulty=difficulty, count=count)
+            label = chapter or "Chapter"
             if not title:
-                title = f"{chapter or 'Analogy'} - Chapter Test - {len(filtered)} Qs"
-            desc = f"Chapter wise test: {chapter or 'Analogy'} - {len(filtered)} questions from file bank"
+                title = f"{label} - Chapter Test - {len(filtered)} Qs"
+            desc = f"Chapter wise test: {label} - {len(filtered)} questions from file bank"
         
         elif test_type == "topic_wise":
-            # e.g., topic=Number Analogy, count=15
-            filtered = filter_questions(topic=topic or "Number Analogy", difficulty=difficulty, count=count)
+            filtered = filter_questions(topic=topic, difficulty=difficulty, count=count)
+            label = topic or "Topic"
             if not title:
-                title = f"{topic or 'Number Analogy'} - Topic Test - {len(filtered)} Qs"
-            desc = f"Topic wise test: {topic} - focused practice"
+                title = f"{label} - Topic Test - {len(filtered)} Qs"
+            desc = f"Topic wise test: {label} - focused practice"
         
         elif test_type == "subject_wise":
-            filtered = filter_questions(subject=subject or "Reasoning", difficulty=difficulty, count=count)
+            filtered = filter_questions(subject=subject, difficulty=difficulty, count=count)
+            label = subject or "Subject"
             if not title:
-                title = f"{subject or 'Reasoning'} - Subject Test - {len(filtered)} Qs"
-            desc = f"Subject wise test: {subject}"
+                title = f"{label} - Subject Test - {len(filtered)} Qs"
+            desc = f"Subject wise test: {label}"
         
         elif test_type == "full_mock":
             # Full mock: mix of all topics, 100 questions like real SSC
@@ -684,26 +704,65 @@ def import_from_files():
         db.session.add(section)
         db.session.flush()
         
+        # Optional AI fallback for questions with no answer in the file
+        try:
+            from app.services.knowledge_engine.free_ai_chain import derive_answer_with_ai
+            AI_ANSWER_AVAILABLE = True
+        except Exception:
+            AI_ANSWER_AVAILABLE = False
+        ai_has_keys = any([
+            __import__("os").getenv(k) for k in
+            ("GEMINI_API_KEY", "GROQ_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY")
+        ])
+
         # Add questions to DB and exam
         added = 0
+        ai_derived = 0
+        skipped_no_answer = 0
         for idx, fq in enumerate(filtered):
             try:
+                options = fq.get("options", [])[:4]
+
+                # --- Resolve correct answer: FILE FIRST, then AI ---
+                correct = fq.get("correct_answer")
+                explanation = fq.get("explanation") or ""
+                answer_source = fq.get("answer_source", "file")
+
+                if not correct and AI_ANSWER_AVAILABLE and ai_has_keys:
+                    ai = derive_answer_with_ai(fq["question_text"], options)
+                    if ai:
+                        correct = ai["correct_answer"]
+                        explanation = explanation or ai.get("explanation", "")
+                        answer_source = ai.get("source", "ai")
+                        ai_derived += 1
+
+                # Still no answer -> skip (never guess "A")
+                if not correct:
+                    skipped_no_answer += 1
+                    continue
+                # Ensure the chosen key actually exists among options
+                valid_keys = {str(o.get("option_key", "")).upper() for o in options}
+                if correct not in valid_keys:
+                    skipped_no_answer += 1
+                    continue
+
                 q = Question(
                     question_text=fq["question_text"][:2000],
                     question_type="single_choice",
                     difficulty=fq.get("difficulty","medium") if fq.get("difficulty") in ["easy","medium","hard"] else "medium",
-                    correct_answer="A",  # Default, will be reviewed
+                    correct_answer=correct,
+                    explanation=explanation[:2000] if explanation else None,
                     marks=2,
                     negative_marks=0.5,
                     is_active=True,
-                    tags=f"{fq.get('subject','')},{fq.get('chapter','')},{fq.get('topic','')},{fq.get('pattern','')}"[:512],
+                    tags=f"{fq.get('subject','')},{fq.get('chapter','')},{fq.get('topic','')},{fq.get('pattern','')},src:{answer_source}"[:512],
                     source=fq.get("source","file_bank")
                 )
                 db.session.add(q)
                 db.session.flush()
                 
                 from app.models.question import QuestionOption
-                for opt_idx, opt in enumerate(fq.get("options", [])[:4]):
+                for opt_idx, opt in enumerate(options):
                     db.session.add(QuestionOption(
                         question_id=q.id,
                         option_key=opt.get("option_key","A"),
@@ -739,7 +798,36 @@ def import_from_files():
         except Exception:
             db.session.rollback()
             return jsonify({"error": "Failed to save exam"}), 500
-        
+
+        # Keep exam totals (total_questions / total_marks / duration) accurate
+        # and remember the file-bank filter so re-attempts can pull FRESH questions.
+        try:
+            exam.recalculate_totals()
+            exam.duration_seconds = max(60, added * 60)  # ~1 min per question
+            rules = exam.get_rules() if hasattr(exam, "get_rules") else {}
+            if not isinstance(rules, dict):
+                rules = {}
+            rules["file_bank_source"] = {
+                "test_type": test_type,
+                "subject": subject,
+                "chapter": chapter,
+                "topic": topic,
+                "difficulty": difficulty,
+                "no_repeat_correct": True,
+            }
+            exam.set_rules(rules)
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+        if added == 0:
+            return jsonify({
+                "error": "Koi valid answer wale questions nahi mile is filter me.",
+                "hint": "File me answer key honi chahiye, ya AI key (GEMINI_API_KEY/GROQ_API_KEY) set karo taki AI answer nikaale.",
+                "skipped_no_answer": skipped_no_answer,
+                "filters_used": {"test_type": test_type, "subject": subject, "chapter": chapter, "topic": topic, "difficulty": difficulty},
+            }), 404
+
         return jsonify({
             "message": f"Real test jaisa ban gaya! {added} questions - {test_type}",
             "exam_id": exam.id,
@@ -747,6 +835,9 @@ def import_from_files():
             "test_type": test_type,
             "filters_used": {"subject": subject, "chapter": chapter, "topic": topic, "difficulty": difficulty, "count": count},
             "questions_added": added,
+            "answers_from_file": added - ai_derived,
+            "answers_from_ai": ai_derived,
+            "skipped_no_answer": skipped_no_answer,
             "stats": get_stats()
         }), 201
         

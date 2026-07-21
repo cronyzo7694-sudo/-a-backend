@@ -389,6 +389,21 @@ def start_attempt():
     if (exam.total_questions or 0) < 1:
         return jsonify({"error": "Exam has no questions"}), 400
 
+    # No-repeat: if this is a file-bank test and the user has mastered some
+    # questions before, refill the exam with FRESH questions of the same topic.
+    try:
+        has_active = Attempt.query.filter_by(
+            exam_id=exam.id, user_id=user_id, status="in_progress"
+        ).first()
+        if not has_active:
+            from app.services.exam_builder import rebuild_file_bank_exam
+            rebuild_file_bank_exam(exam, user_id)
+            db.session.commit()
+            exam.recalculate_totals()
+    except Exception:
+        db.session.rollback()
+        logger.exception("file-bank rebuild skipped for exam=%s", exam.id)
+
     rules = ExamRuleEngine.from_exam(exam)
 
     # Attempt limit from configuration (0 = unlimited)

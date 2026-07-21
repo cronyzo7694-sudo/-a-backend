@@ -384,6 +384,10 @@ def _auto_expire_if_needed(attempt: Attempt, exam: Exam) -> bool:
 @attempts_bp.post("/start")
 @jwt_required()
 def start_attempt():
+    """Start (or resume) an attempt. Hardened against Postgres transaction
+    poisoning: every DB write is wrapped, and on any failure we immediately
+    rollback so the session never enters the 'transaction has been rolled back'
+    cascade. exam_id is always a validated integer (never NULL)."""
     data = _json_body()
     exam_id = data.get("exam_id")
     if exam_id is None:
@@ -392,10 +396,13 @@ def start_attempt():
     if exam_id_i is None:
         return jsonify({"error": "Invalid exam_id"}), 400
 
-    exam = Exam.query.get_or_404(exam_id_i)
     user_id = _identity_int()
     if user_id is None:
         return jsonify({"error": "Unauthorized"}), 401
+
+    exam = Exam.query.get(exam_id_i)
+    if exam is None:
+        return jsonify({"error": "Exam not found"}), 404
 
     user = User.query.get(user_id)
     allowed, reason = check_exam_access(user, exam)
@@ -414,35 +421,47 @@ def start_attempt():
     max_attempts = rules.max_attempts_per_user()
     if max_attempts > 0:
         finished = Attempt.query.filter(
-            Attempt.exam_id == exam.id,
+            Attempt.exam_id == exam_id_i,
             Attempt.user_id == user_id,
             Attempt.status.in_(("submitted", "auto_submitted", "evaluated")),
         ).count()
         if finished >= max_attempts:
             return jsonify({"error": "Maximum attempts reached for this exam"}), 403
 
+    # Resume an existing in-progress attempt if allowed and not expired.
     existing = (
-        Attempt.query.filter_by(exam_id=exam.id, user_id=user_id, status="in_progress")
+        Attempt.query.filter_by(exam_id=exam_id_i, user_id=user_id, status="in_progress")
         .order_by(Attempt.id.desc())
         .first()
     )
     if existing:
         if not rules.resume_allowed():
             return jsonify({"error": "Resume is not allowed for this exam configuration"}), 403
-        if _auto_expire_if_needed(existing, exam):
-            try:
+        expired = False
+        try:
+            expired = _auto_expire_if_needed(existing, exam)
+            if expired:
                 db.session.commit()
+        except Exception:
+            db.session.rollback()
+            logger.exception("auto-expire existing attempt failed")
+            expired = False
+        if not expired:
+            # Re-fetch to guarantee attached objects, then build player payload.
+            existing = Attempt.query.get(existing.id)
+            exam = Exam.query.get(exam_id_i)
+            try:
+                return jsonify(_build_player_payload(existing, exam))
             except Exception:
                 db.session.rollback()
-                logger.exception("auto-expire existing attempt failed")
-        else:
-            return jsonify(_build_player_payload(existing, exam))
+                logger.exception("resume payload build failed attempt=%s", existing.id)
+                return jsonify({"error": "Could not resume attempt"}), 500
 
+    # --- Create a brand new attempt ---
     now = _utcnow()
 
-    # A commit/rollback above (resume / auto-expire path) can expire or detach
-    # the `exam` ORM object. Re-fetch it fresh so every attribute below (id,
-    # totals, duration) is reliably populated -> fixes exam_id NULL on insert.
+    # Re-fetch exam fresh (a commit/rollback above can expire/detach it, which
+    # made exam.id read as NULL on Postgres -> the exam_id NOT NULL crash).
     exam = Exam.query.get(exam_id_i)
     if exam is None:
         return jsonify({"error": "Exam not found"}), 404
@@ -452,16 +471,17 @@ def start_attempt():
     if duration < 1:
         duration = 3600
 
-    # Pick the questions for THIS attempt. For file-bank "pool" exams this
-    # returns a real-paper-sized subset that excludes questions the user has
-    # already answered correctly (no-repeat, zero AI cost). For normal exams it
-    # returns all questions unchanged.
+    # Choose this attempt's questions (pool subset with per-user no-repeat).
     try:
         from app.services.exam_builder import select_attempt_questions
         selected_eqs = select_attempt_questions(exam, user_id)
     except Exception:
-        logger.exception("select_attempt_questions failed exam=%s", exam.id)
-        selected_eqs = ExamQuestion.query.filter_by(exam_id=exam.id).all()
+        db.session.rollback()
+        logger.exception("select_attempt_questions failed exam=%s", exam_id_i)
+        selected_eqs = ExamQuestion.query.filter_by(exam_id=exam_id_i).all()
+
+    if not selected_eqs:
+        return jsonify({"error": "Exam has no questions"}), 400
 
     selected_count = len(selected_eqs)
     selected_marks = 0.0
@@ -471,40 +491,53 @@ def start_attempt():
         except (TypeError, ValueError):
             pass
 
-    # Use the validated integer exam id (never rely on a possibly-expired ORM
-    # attribute after intermediate queries/flushes -> avoids exam_id NULL crash)
-    safe_exam_id = exam_id_i or exam.id
-    attempt = Attempt(
-        exam_id=safe_exam_id,
-        user_id=user_id,
-        status="in_progress",
-        started_at=now,
-        expires_at=now + timedelta(seconds=duration),
-        duration_seconds=duration,
-        total_questions=selected_count or exam.total_questions,
-        max_score=selected_marks or exam.total_marks,
-    )
-    if attempt.exam_id is None:
-        return jsonify({"error": "Exam reference lost, please retry"}), 400
-    db.session.add(attempt)
-    db.session.flush()
+    # Hard guarantee: exam_id is a valid integer, never NULL.
+    if not exam_id_i:
+        return jsonify({"error": "Invalid exam reference"}), 400
 
-    for eq in selected_eqs:
-        db.session.add(
-            AttemptAnswer(
-                attempt_id=attempt.id,
-                question_id=eq.question_id,
-                exam_question_id=eq.id,
-                section_id=eq.section_id,
-            )
-        )
     try:
+        # no_autoflush: we are assembling several rows; don't let an intermediate
+        # query trigger a partial flush of a half-built object.
+        with db.session.no_autoflush:
+            attempt = Attempt(
+                exam_id=exam_id_i,
+                user_id=user_id,
+                status="in_progress",
+                started_at=now,
+                expires_at=now + timedelta(seconds=duration),
+                duration_seconds=duration,
+                total_questions=selected_count or exam.total_questions,
+                max_score=selected_marks or exam.total_marks,
+            )
+            if attempt.exam_id is None:
+                raise ValueError("exam_id resolved to None")
+            db.session.add(attempt)
+            db.session.flush()
+
+            for eq in selected_eqs:
+                db.session.add(
+                    AttemptAnswer(
+                        attempt_id=attempt.id,
+                        question_id=eq.question_id,
+                        exam_question_id=eq.id,
+                        section_id=eq.section_id,
+                    )
+                )
         db.session.commit()
     except Exception:
         db.session.rollback()
-        logger.exception("start_attempt commit failed")
+        logger.exception("start_attempt create failed exam=%s user=%s", exam_id_i, user_id)
         return jsonify({"error": "Could not start attempt"}), 500
-    return jsonify(_build_player_payload(attempt, exam)), 201
+
+    # Build payload with attached, freshly-committed objects.
+    try:
+        attempt = Attempt.query.get(attempt.id)
+        exam = Exam.query.get(exam_id_i)
+        return jsonify(_build_player_payload(attempt, exam)), 201
+    except Exception:
+        db.session.rollback()
+        logger.exception("start payload build failed attempt=%s", getattr(attempt, "id", None))
+        return jsonify({"error": "Attempt started but payload failed, please reload"}), 500
 
 
 @attempts_bp.get("/<int:attempt_id>")

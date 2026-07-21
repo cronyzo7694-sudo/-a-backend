@@ -270,20 +270,52 @@ def create_exam():
         db.session.rollback()
         logger.exception("create_exam failed")
         return jsonify({"error": "Could not create exam"}), 500
-    # AUTO-GENERATE child tests from the file bank for this exam's syllabus.
-    # Only topics that actually have questions in files get a test (skip_silent).
-    auto_summary = None
-    try:
-        if bool(data.get("auto_generate", True)):
-            from app.services.auto_test import generate_tests_for_exam
-            auto_summary = generate_tests_for_exam(exam)
-    except Exception:
-        logger.exception("auto test generation failed for exam=%s", exam.id)
 
-    resp = {"message": "Exam created", "item": exam.to_dict()}
-    if auto_summary is not None:
-        resp["auto_tests"] = auto_summary
-    return jsonify(resp), 201
+    # Auto-generate tests in a BACKGROUND thread so the request returns instantly
+    # (generating tests for a full SSC syllabus can take a while and was causing
+    # gunicorn WORKER TIMEOUT -> 500 / "Failed to fetch"). The exam is marked
+    # coming_soon=true immediately; the background job fills in tests, and a
+    # later page refresh / file reload shows them.
+    exam_id_bg = exam.id
+    if bool(data.get("auto_generate", True)):
+        try:
+            # mark coming soon right away so UI shows a friendly state
+            rules = exam.get_rules() or {}
+            rules["coming_soon"] = {"active": True, "reason": "Tests generate ho rahe hain..."}
+            exam.set_rules(rules)
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+        _spawn_test_generation(exam_id_bg)
+
+    return jsonify({"message": "Exam created", "item": exam.to_dict()}), 201
+
+
+def _spawn_test_generation(exam_id: int) -> None:
+    """Run generate_tests_for_exam in a background thread with its own app
+    context + DB session, so the HTTP request is not blocked."""
+    import threading
+    from flask import current_app
+
+    app_obj = current_app._get_current_object()
+
+    def _job():
+        with app_obj.app_context():
+            try:
+                from app.services.auto_test import generate_tests_for_exam
+                ex = Exam.query.get(exam_id)
+                if ex is not None:
+                    generate_tests_for_exam(ex)
+            except Exception:
+                logger.exception("background test generation failed exam=%s", exam_id)
+            finally:
+                try:
+                    db.session.remove()
+                except Exception:
+                    pass
+
+    t = threading.Thread(target=_job, name=f"gen-tests-{exam_id}", daemon=True)
+    t.start()
 
 
 @exams_bp.put("/<int:exam_id>")

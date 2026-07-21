@@ -241,7 +241,20 @@ def create_exam():
         db.session.rollback()
         logger.exception("create_exam failed")
         return jsonify({"error": "Could not create exam"}), 500
-    return jsonify({"message": "Exam created", "item": exam.to_dict()}), 201
+    # AUTO-GENERATE child tests from the file bank for this exam's syllabus.
+    # Only topics that actually have questions in files get a test (skip_silent).
+    auto_summary = None
+    try:
+        if bool(data.get("auto_generate", True)):
+            from app.services.auto_test import generate_tests_for_exam
+            auto_summary = generate_tests_for_exam(exam)
+    except Exception:
+        logger.exception("auto test generation failed for exam=%s", exam.id)
+
+    resp = {"message": "Exam created", "item": exam.to_dict()}
+    if auto_summary is not None:
+        resp["auto_tests"] = auto_summary
+    return jsonify(resp), 201
 
 
 @exams_bp.put("/<int:exam_id>")
@@ -557,6 +570,29 @@ def file_bank_stats():
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 500
 
+@exams_bp.post("/<int:exam_id>/make-tests-by-ai")
+@roles_required("admin")
+def make_tests_by_ai(exam_id):
+    """
+    Manual trigger: build syllabus tests for an exam whose topics weren't found
+    in the file bank at creation time. AI is allowed to fill missing answers.
+    """
+    exam = Exam.query.get_or_404(exam_id)
+    try:
+        from app.services.auto_test import generate_tests_for_exam
+        summary = generate_tests_for_exam(exam)
+        if summary.get("created", 0) == 0:
+            return jsonify({
+                "message": "Koi naya test nahi bana - in topics ke questions file bank me nahi mile.",
+                "hint": "Us topic ki .txt file questions_data me daalo, ya AI key set karo.",
+                **summary,
+            })
+        return jsonify({"message": f"{summary['created']} tests ban gaye", **summary})
+    except Exception as e:
+        logger.exception("make_tests_by_ai failed exam=%s", exam_id)
+        return jsonify({"error": str(e)[:300]}), 500
+
+
 @exams_bp.post("/file-bank/reload")
 @roles_required("admin")
 def file_bank_reload():
@@ -564,7 +600,20 @@ def file_bank_reload():
     try:
         from app.services.file_bank import reload_file_bank, get_stats
         n = reload_file_bank()
-        return jsonify({"message": f"File bank reloaded - {n} questions", "total": n, "stats": get_stats()})
+        auto_summary = None
+        # After new files load, auto-build standalone tests for the new content.
+        if request.args.get("auto", "true").lower() != "false":
+            try:
+                from app.services.auto_test import generate_tests_for_bank
+                auto_summary = generate_tests_for_bank()
+            except Exception:
+                logger.exception("auto test generation after reload failed")
+        return jsonify({
+            "message": f"File bank reloaded - {n} questions",
+            "total": n,
+            "stats": get_stats(),
+            "auto_tests": auto_summary,
+        })
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 500
 

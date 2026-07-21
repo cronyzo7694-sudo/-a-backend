@@ -111,6 +111,130 @@ def _clean_source_name(filename):
 
 
 # ---------------------------------------------------------------------------
+# Filename -> Subject / Chapter mapping (the reliable, token-free source)
+# One file = one chapter/topic (analogy file, percentage file, etc.)
+# ---------------------------------------------------------------------------
+# Known subject keywords found in file names -> canonical subject
+_SUBJECT_HINTS = [
+    (("reasoning", "resoning", "reason"), "Reasoning"),
+    (("quant", "quantitative", "maths", "math", "arithmetic", "aptitude"), "Quantitative Aptitude"),
+    (("english", "grammar", "vocab", "comprehension"), "English"),
+    (("gk", "general knowledge", "general awareness", "awareness", "current affairs", "gs", "general studies"), "General Awareness"),
+    (("science", "physics", "chemistry", "biology"), "General Science"),
+    (("history",), "General Awareness"),
+    (("geography", "polity", "economics", "civics"), "General Awareness"),
+    (("computer",), "Computer"),
+]
+
+# Chapter keyword -> (subject, canonical chapter). First match wins.
+_CHAPTER_HINTS = [
+    ("analogy", ("Reasoning", "Analogy")),
+    ("classification", ("Reasoning", "Classification")),
+    ("odd one out", ("Reasoning", "Classification")),
+    ("series", ("Reasoning", "Series")),
+    ("coding decoding", ("Reasoning", "Coding-Decoding")),
+    ("coding", ("Reasoning", "Coding-Decoding")),
+    ("blood relation", ("Reasoning", "Blood Relations")),
+    ("direction", ("Reasoning", "Direction Sense")),
+    ("syllogism", ("Reasoning", "Syllogism")),
+    ("venn", ("Reasoning", "Venn Diagram")),
+    ("percentage", ("Quantitative Aptitude", "Percentage")),
+    ("profit", ("Quantitative Aptitude", "Profit and Loss")),
+    ("loss", ("Quantitative Aptitude", "Profit and Loss")),
+    ("ratio", ("Quantitative Aptitude", "Ratio and Proportion")),
+    ("average", ("Quantitative Aptitude", "Average")),
+    ("time and work", ("Quantitative Aptitude", "Time and Work")),
+    ("time speed", ("Quantitative Aptitude", "Time Speed Distance")),
+    ("speed", ("Quantitative Aptitude", "Time Speed Distance")),
+    ("si units", ("General Science", "Units and Measurements")),
+    ("units", ("General Science", "Units and Measurements")),
+    ("number system", ("Quantitative Aptitude", "Number System")),
+    ("simple interest", ("Quantitative Aptitude", "Simple Interest")),
+    ("compound interest", ("Quantitative Aptitude", "Compound Interest")),
+    ("mensuration", ("Quantitative Aptitude", "Mensuration")),
+    ("algebra", ("Quantitative Aptitude", "Algebra")),
+    ("geometry", ("Quantitative Aptitude", "Geometry")),
+    ("trigonometry", ("Quantitative Aptitude", "Trigonometry")),
+    ("history", ("General Awareness", "History")),
+    ("geography", ("General Awareness", "Geography")),
+    ("polity", ("General Awareness", "Polity")),
+    ("economics", ("General Awareness", "Economics")),
+    ("synonym", ("English", "Synonyms")),
+    ("antonym", ("English", "Antonyms")),
+    ("idiom", ("English", "Idioms and Phrases")),
+]
+
+
+def _refine_topic(qtext, options, subject, chapter):
+    """
+    Light, local-only topic refinement inside a chapter (no AI, no tokens).
+    Falls back to the chapter name so a topic is always present.
+    """
+    text = (qtext + " " + " ".join(o.get("option_text", "") for o in (options or []))).lower()
+    ch = (chapter or "").lower()
+
+    if "analogy" in ch:
+        # Number analogy: mostly digits / number relations
+        if re.search(r"\d+\s*[:\-]\s*\d+", text) or re.search(r"\d{2,}", text):
+            # if it's clearly word based (few digits), call it word analogy
+            digit_ratio = len(re.findall(r"\d", text)) / max(1, len(text))
+            if digit_ratio > 0.04:
+                return "Number Analogy"
+        if "::" in qtext or ":" in qtext:
+            return "Word Analogy"
+        return "General Analogy"
+
+    if "units" in ch or "measurement" in ch:
+        if "pressure" in text or "pascal" in text:
+            return "Pressure Units"
+        if "force" in text or "newton" in text:
+            return "Force Units"
+        return "SI Units"
+
+    # default: topic = chapter
+    return chapter or "General"
+
+
+def infer_subject_chapter_from_filename(filename):
+    """
+    One file = one chapter. Derive (subject, chapter) purely from the file name.
+    This is reliable and costs zero tokens. Per-question AI guessing is NOT used
+    for subject/chapter (that was causing wrong 'General/History' buckets).
+    """
+    stem = Path(filename).stem.lower().replace("_", " ").replace("-", " ")
+    stem = re.sub(r"\bresoning\b", "reasoning", stem)
+
+    subject = None
+    chapter = None
+
+    # 1) Chapter keyword (most specific) also tells us the subject
+    for kw, (subj, chap) in _CHAPTER_HINTS:
+        if kw in stem:
+            subject, chapter = subj, chap
+            break
+
+    # 2) Subject keyword if chapter map didn't fix subject
+    if subject is None:
+        for keys, subj in _SUBJECT_HINTS:
+            if any(k in stem for k in keys):
+                subject = subj
+                break
+
+    # 3) Chapter fallback = cleaned filename (minus the subject word)
+    if chapter is None:
+        cleaned = stem
+        for keys, _s in _SUBJECT_HINTS:
+            for k in keys:
+                cleaned = cleaned.replace(k, " ")
+        chapter = _normspace(cleaned).title() or "General"
+
+    if subject is None:
+        subject = "General"
+
+    return subject, chapter
+
+
+# ---------------------------------------------------------------------------
 # Answer-key + solution parsing (the important fix)
 # ---------------------------------------------------------------------------
 def _parse_answer_key(text):
@@ -234,6 +358,10 @@ def load_questions_from_files():
             parsed = _parse_question_blocks(body_region)
 
             source_title = _clean_source_name(txt_file.name)
+            # ONE FILE = ONE CHAPTER. Subject & chapter come from the FILE NAME
+            # (reliable, zero-token). This stops the wrong "General/History"
+            # buckets that per-question keyword guessing was producing.
+            file_subject, file_chapter = infer_subject_chapter_from_filename(txt_file.name)
 
             for qn, q in parsed.items():
                 # RESOLVE ANSWER: answer key first, then solution, else None (AI later)
@@ -244,12 +372,8 @@ def load_questions_from_files():
                 qtext = q["question_text"]
                 options = q["options"]
 
-                try:
-                    classification = smart_classify(qtext, options)
-                except Exception:
-                    classification = {"subject": source_title.split()[0] if source_title else "General",
-                                      "chapter": "General", "topic": "General",
-                                      "concepts": [], "pattern": None}
+                # Topic refinement WITHIN the file's chapter (cheap, local only).
+                topic = _refine_topic(qtext, options, file_subject, file_chapter)
 
                 try:
                     if KNOWLEDGE_AVAILABLE:
@@ -268,13 +392,13 @@ def load_questions_from_files():
                     "correct_answer": correct,          # <-- REAL answer (or None)
                     "explanation": explanation,         # <-- REAL solution text
                     "answer_source": ("file" if correct else "missing"),
-                    "subject": classification.get("subject") or (source_title.split()[0] if source_title else "General"),
-                    "chapter": classification.get("chapter") or "General",
-                    "topic": classification.get("topic") or "General",
-                    "subtopic": classification.get("subtopic"),
-                    "concepts": classification.get("concepts", []),
-                    "pattern": classification.get("pattern"),
-                    "question_family": classification.get("question_family"),
+                    "subject": file_subject,            # <-- from filename (reliable)
+                    "chapter": file_chapter,            # <-- from filename (reliable)
+                    "topic": topic,
+                    "subtopic": None,
+                    "concepts": [topic] if topic and topic != "General" else [],
+                    "pattern": None,
+                    "question_family": file_chapter,
                     "difficulty": diff if diff in ("easy", "medium", "hard") else "medium",
                     "expected_time": exp_time,
                     "source": txt_file.name,

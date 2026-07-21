@@ -23,11 +23,26 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 from typing import Dict, List, Optional, Set, Tuple
 
 from app.extensions import db
 from app.models.exam import Exam, ExamQuestion, ExamSection
 from app.models.question import Question, QuestionOption
+
+# Per-exam locks so two concurrent runs (create's background thread + a file
+# reload/refresh) can't both generate the same tests -> no duplicates.
+_gen_locks: Dict[int, threading.Lock] = {}
+_gen_locks_guard = threading.Lock()
+
+
+def _lock_for(exam_id: int) -> threading.Lock:
+    with _gen_locks_guard:
+        lk = _gen_locks.get(exam_id)
+        if lk is None:
+            lk = threading.Lock()
+            _gen_locks[exam_id] = lk
+        return lk
 from app.services import syllabus_kb as kb
 
 logger = logging.getLogger("exam_os.services.auto_test")
@@ -305,9 +320,19 @@ def _set_coming_soon(exam: Exam, on: bool, reason: str = "") -> None:
 # Main: generate tests for ONE exam
 # ---------------------------------------------------------------------------
 def generate_tests_for_exam(exam: Exam) -> Dict:
+    """Thread-safe wrapper: serialize generation per exam to prevent duplicate
+    tests from concurrent runs (create bg-thread + file reload)."""
+    if exam is None or exam.parent_exam_id is not None:
+        return {"created": 0, "skipped": 0, "coming_soon": False, "tests": []}
+    lock = _lock_for(exam.id)
+    with lock:
+        return _generate_tests_for_exam_locked(exam)
+
+
+def _generate_tests_for_exam_locked(exam: Exam) -> Dict:
     """
     Create/refresh tests inside `exam` based on its syllabus + file bank.
-    Returns a summary dict.
+    Returns a summary dict. Must be called under the per-exam lock.
     """
     if exam is None or exam.parent_exam_id is not None:
         # Only top-level exams get auto tests (children ARE the tests).

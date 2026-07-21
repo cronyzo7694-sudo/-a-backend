@@ -167,8 +167,12 @@ def get_exam(exam_id):
                     fb = crules.get("file_bank_source") or {}
                     qpa = fb.get("questions_per_attempt")
                     if qpa:
-                        cd["questions_per_attempt"] = int(qpa)
-                        cd["total_questions"] = int(qpa)
+                        qpa = int(qpa)
+                        cd["questions_per_attempt"] = qpa
+                        cd["total_questions"] = qpa
+                        # Marks reflect the per-attempt paper, not the whole pool.
+                        per_q = float(cd.get("default_marks") or 2)
+                        cd["total_marks"] = round(qpa * per_q, 2)
                 except Exception:
                     cd["coming_soon"] = False
                 child_list.append(cd)

@@ -714,13 +714,21 @@ def factory_reset():
         conn.execute(text("DELETE FROM attempts"))
         conn.execute(text("DELETE FROM exam_questions"))
         conn.execute(text("DELETE FROM exam_sections"))
-        # questions created by auto/file tests (source marks them) - safe to drop
-        conn.execute(text("DELETE FROM question_options WHERE question_id IN (SELECT id FROM questions WHERE source IS NOT NULL AND source <> '' )"))
-        conn.execute(text("DELETE FROM questions WHERE source IS NOT NULL AND source <> ''"))
         conn.execute(text("DELETE FROM exams"))
+        # Wipe ALL questions + options (demo seed data too) so the Question Bank
+        # count reflects only what YOU add via files/exams — not seeded demo rows.
+        conn.execute(text("DELETE FROM question_options"))
+        conn.execute(text("DELETE FROM questions"))
+        # Wipe demo subjects/chapters so the sidebar counts aren't fake seed data.
+        # (These tables are recreated as you add real content.)
+        for tbl in ("chapters", "subjects"):
+            try:
+                conn.execute(text(f"DELETE FROM {tbl}"))
+            except Exception:
+                logger.exception("factory_reset: could not clear %s", tbl)
         db.session.expire_all()
         db.session.commit()
-        return jsonify({"message": "Factory reset done. Ab exam banao - test apne aap ban jayenge (agar file me questions hain)."})
+        return jsonify({"message": "Factory reset done. DB clean. Ab exam banao - test apne aap ban jayenge (agar file me questions hain)."})
     except Exception as e:
         db.session.rollback()
         logger.exception("factory_reset failed")

@@ -118,8 +118,17 @@ def list_exams():
         .limit(per_page)
         .all()
     )
+    def _item(e):
+        d = e.to_dict(include_sections=True)
+        try:
+            cs = (e.get_rules() or {}).get("coming_soon") or {}
+            d["coming_soon"] = bool(cs.get("active"))
+        except Exception:
+            d["coming_soon"] = False
+        return d
+
     return jsonify({
-        "items": [e.to_dict(include_sections=True) for e in items],
+        "items": [_item(e) for e in items],
         "total": total,
         "page": page,
         "per_page": per_page,
@@ -150,6 +159,13 @@ def get_exam(exam_id):
         data["resolved_rules"] = ExamRuleEngine.from_exam(exam).to_public_dict()
     except Exception:
         data["resolved_rules"] = {}
+    # Additive: coming-soon flag (exam has no tests yet, questions not in files)
+    try:
+        cs = (exam.get_rules() or {}).get("coming_soon") or {}
+        data["coming_soon"] = bool(cs.get("active"))
+        data["coming_soon_reason"] = cs.get("reason", "")
+    except Exception:
+        data["coming_soon"] = False
     return jsonify(data)
 
 
@@ -348,22 +364,24 @@ def delete_exam(exam_id):
         # Delete bottom-up with RAW SQL to bypass SQLAlchemy's ORM cascade,
         # which otherwise tries to UPDATE attempts.exam_id = NULL (the crash).
         # Order: attempt_answers -> attempts -> exam_questions -> sections -> exams
+        # Uses expanding IN bindparams so it works on BOTH Postgres and SQLite.
+        from sqlalchemy import bindparam
         conn = db.session.connection()
-        conn.execute(text("""
-            DELETE FROM attempt_answers
-            WHERE attempt_id IN (SELECT id FROM attempts WHERE exam_id = ANY(:ids))
-        """), {"ids": exam_ids})
-        conn.execute(text("""
-            DELETE FROM attempt_answers
-            WHERE exam_question_id IN (SELECT id FROM exam_questions WHERE exam_id = ANY(:ids))
-        """), {"ids": exam_ids})
-        conn.execute(text("DELETE FROM attempts WHERE exam_id = ANY(:ids)"), {"ids": exam_ids})
-        conn.execute(text("DELETE FROM exam_questions WHERE exam_id = ANY(:ids)"), {"ids": exam_ids})
-        conn.execute(text("DELETE FROM exam_sections WHERE exam_id = ANY(:ids)"), {"ids": exam_ids})
+
+        def _run(sql, ids):
+            conn.execute(text(sql).bindparams(bindparam("ids", expanding=True)), {"ids": ids})
+
+        _run("DELETE FROM attempt_answers WHERE attempt_id IN "
+             "(SELECT id FROM attempts WHERE exam_id IN :ids)", exam_ids)
+        _run("DELETE FROM attempt_answers WHERE exam_question_id IN "
+             "(SELECT id FROM exam_questions WHERE exam_id IN :ids)", exam_ids)
+        _run("DELETE FROM attempts WHERE exam_id IN :ids", exam_ids)
+        _run("DELETE FROM exam_questions WHERE exam_id IN :ids", exam_ids)
+        _run("DELETE FROM exam_sections WHERE exam_id IN :ids", exam_ids)
         # Child exams first, then the parent.
         child_ids = [i for i in exam_ids if i != exam.id]
         if child_ids:
-            conn.execute(text("DELETE FROM exams WHERE id = ANY(:ids)"), {"ids": child_ids})
+            _run("DELETE FROM exams WHERE id IN :ids", child_ids)
         conn.execute(text("DELETE FROM exams WHERE id = :id"), {"id": exam.id})
 
         # Expire ORM identity map so stale objects aren't re-flushed.
@@ -577,8 +595,12 @@ def unpublish_exam(exam_id):
 # - Optimistic locking when publishing concurrent edits
 # --------------------------------------------
 
-# FILE-BASED REAL TEST SYSTEM - Chapter wise, Topic wise, Subject wise, Full Mock
-# Put file in questions_data folder, create test like real SSC exam
+
+# ============================================================================
+# FILE BANK (read-only) + EXAM-DRIVEN AUTO TESTS
+# Design: NO exam -> NO test. Exam with no matching questions -> "Coming Soon".
+# Questions come from questions_data/*.txt; tests live INSIDE the exam.
+# ============================================================================
 
 @exams_bp.get("/file-bank/stats")
 @jwt_required()
@@ -586,449 +608,75 @@ def file_bank_stats():
     try:
         from app.services import file_bank as _fb
         from app.services.file_bank import get_stats
-        stats = get_stats()
         return jsonify({
-            "message": "File bank stats - real test jaisa",
+            "message": "File bank stats",
             "total_file_questions": len(_fb.FILE_QUESTIONS),
-            "stats": stats,
-            "available_test_types": ["chapter_wise", "topic_wise", "subject_wise", "full_mock", "pyq", "difficulty_wise", "random"],
-            "example": {
-                "chapter_wise": "Analogy chapter ke 20 questions ka test",
-                "topic_wise": "Number Analogy topic ke 15 questions",
-                "subject_wise": "Reasoning subject ke 50 questions",
-                "full_mock": "Full 100 questions mock like real SSC"
-            }
+            "stats": get_stats(),
         })
     except Exception as e:
-        return jsonify({"error": str(e)[:300]}), 500
-
-@exams_bp.post("/<int:exam_id>/make-tests-by-ai")
-@roles_required("admin")
-def make_tests_by_ai(exam_id):
-    """
-    Manual trigger: build syllabus tests for an exam whose topics weren't found
-    in the file bank at creation time. AI is allowed to fill missing answers.
-    """
-    exam = Exam.query.get_or_404(exam_id)
-    try:
-        from app.services.auto_test import generate_tests_for_exam
-        summary = generate_tests_for_exam(exam)
-        if summary.get("created", 0) == 0:
-            return jsonify({
-                "message": "Koi naya test nahi bana - in topics ke questions file bank me nahi mile.",
-                "hint": "Us topic ki .txt file questions_data me daalo, ya AI key set karo.",
-                **summary,
-            })
-        return jsonify({"message": f"{summary['created']} tests ban gaye", **summary})
-    except Exception as e:
-        logger.exception("make_tests_by_ai failed exam=%s", exam_id)
-        return jsonify({"error": str(e)[:300]}), 500
-
-
-@exams_bp.post("/file-bank/cleanup-auto")
-@roles_required("admin")
-def cleanup_auto_tests():
-    """
-    Delete previously auto-generated tests that were wrongly created as
-    top-level (standalone) exams. Keeps manual exams and subject containers.
-    Use this once, then run reload to regenerate them correctly (inside a
-    subject container).
-    """
-    try:
-        from sqlalchemy import text
-
-        conn = db.session.connection()
-
-        # STEP 1 (FIRST, before any ORM query): nuke BROKEN attempts with raw SQL.
-        # A row like (id=1, exam_id=NULL) makes SQLAlchemy autoflush try
-        # 'UPDATE attempts SET exam_id=NULL' and crash every request. Raw SQL
-        # avoids the ORM entirely so we can clean it safely.
-        broken = 0
-        try:
-            res = conn.execute(text("""
-                DELETE FROM attempt_answers
-                WHERE attempt_id IN (
-                    SELECT id FROM attempts
-                    WHERE exam_id IS NULL
-                       OR exam_id NOT IN (SELECT id FROM exams)
-                )
-            """))
-            res2 = conn.execute(text("""
-                DELETE FROM attempts
-                WHERE exam_id IS NULL
-                   OR exam_id NOT IN (SELECT id FROM exams)
-            """))
-            broken = res2.rowcount or 0
-        except Exception:
-            logger.exception("broken-attempt raw cleanup failed")
-
-        # Clear any ORM identity-map state so the next queries are clean.
-        db.session.expire_all()
-
-        # STEP 2: find top-level file-bank tests / old containers to remove.
-        removed = []
-        target_ids = []
-        for ex in Exam.query.filter_by(parent_exam_id=None).all():
-            try:
-                rules = ex.get_rules() or {}
-            except Exception:
-                rules = {}
-            is_container = bool(rules.get("auto_container"))
-            is_file_bank_test = bool(rules.get("auto_generated")) or bool(rules.get("file_bank_source"))
-            if is_file_bank_test or is_container:
-                removed.append({"exam_id": ex.id, "title": ex.title})
-                target_ids.append(ex.id)
-
-        # Include their child exams (pool tests live as children).
-        if target_ids:
-            for child in Exam.query.filter(Exam.parent_exam_id.in_(target_ids)).all():
-                target_ids.append(child.id)
-
-        # STEP 3: delete those exams bottom-up with raw SQL (bypass ORM cascade).
-        if target_ids:
-            conn.execute(text("""
-                DELETE FROM attempt_answers
-                WHERE attempt_id IN (SELECT id FROM attempts WHERE exam_id = ANY(:ids))
-            """), {"ids": target_ids})
-            conn.execute(text("""
-                DELETE FROM attempt_answers
-                WHERE exam_question_id IN (SELECT id FROM exam_questions WHERE exam_id = ANY(:ids))
-            """), {"ids": target_ids})
-            conn.execute(text("DELETE FROM attempts WHERE exam_id = ANY(:ids)"), {"ids": target_ids})
-            conn.execute(text("DELETE FROM exam_questions WHERE exam_id = ANY(:ids)"), {"ids": target_ids})
-            conn.execute(text("DELETE FROM exam_sections WHERE exam_id = ANY(:ids)"), {"ids": target_ids})
-            conn.execute(text("DELETE FROM exams WHERE id = ANY(:ids)"), {"ids": target_ids})
-
-        db.session.expire_all()
-        db.session.commit()
-        return jsonify({
-            "message": f"{len(removed)} purane top-level tests/containers hataye, {broken} toote hue attempts (crash wale) saaf kiye. Ab exam banao (jaise SSC CHSL) — uske andar tests apne aap ban jayenge.",
-            "removed": removed,
-            "broken_attempts_removed": broken,
-        })
-    except Exception as e:
-        db.session.rollback()
         return jsonify({"error": str(e)[:300]}), 500
 
 
 @exams_bp.post("/file-bank/reload")
 @roles_required("admin")
 def file_bank_reload():
-    """Re-scan the questions_data folder after adding/updating .txt files."""
+    """Re-scan questions_data, then re-check EVERY exam so new questions turn
+    'Coming Soon' exams into real tests automatically."""
     try:
         from app.services.file_bank import reload_file_bank, get_stats
+        from app.services.auto_test import refresh_all_exams
         n = reload_file_bank()
-        # NOTE: file reload only refreshes the question bank. Tests are NOT
-        # created here anymore — tests are created INSIDE an exam when you add
-        # an exam (SSC CHSL etc.). This keeps the exams list clean.
+        refreshed = refresh_all_exams()
         return jsonify({
-            "message": f"File bank reloaded - {n} questions. Ab exam banao (jaise SSC CHSL), uske andar tests apne aap ban jayenge.",
+            "message": f"File bank reloaded - {n} questions. Exams re-checked.",
             "total": n,
             "stats": get_stats(),
-            "auto_tests": None,
+            "refresh": refreshed,
         })
-    except Exception as e:
-        return jsonify({"error": str(e)[:300]}), 500
-
-@exams_bp.get("/file-bank/questions")
-@jwt_required()
-def file_bank_questions():
-    try:
-        from app.services.file_bank import FILE_QUESTIONS
-        # Query params: subject, chapter, topic, difficulty, count
-        subject = request.args.get("subject")
-        chapter = request.args.get("chapter")
-        topic = request.args.get("topic")
-        difficulty = request.args.get("difficulty")
-        count = int(request.args.get("count", 20))
-        count = min(count, 100)  # Max 100 per preview
-        
-        from app.services.file_bank import filter_questions
-        filtered = filter_questions(subject=subject, chapter=chapter, topic=topic, difficulty=difficulty, count=count)
-        
-        return jsonify({
-            "total_in_file_bank": len(FILE_QUESTIONS),
-            "filtered_count": len(filtered),
-            "filters": {"subject": subject, "chapter": chapter, "topic": topic, "difficulty": difficulty, "count": count},
-            "questions": filtered[:count]
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)[:500]}), 500
-
-@exams_bp.post("/import-from-files")
-@roles_required("admin")
-def import_from_files():
-    """
-    Real test jaisa - Chapter wise, Topic wise, Subject wise, Full Mock
-    Body: {
-      "test_type": "chapter_wise" | "topic_wise" | "subject_wise" | "full_mock" | "random",
-      "subject": "Reasoning",
-      "chapter": "Analogy",
-      "topic": "Number Analogy",  # optional - Number Analogy, Word Analogy, etc
-      "difficulty": "easy" | "medium" | "hard" | null,
-      "count": 20,
-      "title": "Custom Test Name"
-    }
-    """
-    try:
-        from app.services.file_bank import FILE_QUESTIONS, filter_questions, get_stats
-        
-        data = request.get_json(silent=True) or {}
-        
-        if not FILE_QUESTIONS:
-            return jsonify({"error": "questions_data folder me koi txt file nahi mili. Folder: backend/questions_data/ me .txt file daalo"}), 404
-        
-        test_type = data.get("test_type", "chapter_wise")
-        subject = data.get("subject")
-        chapter = data.get("chapter")
-        topic = data.get("topic")  # e.g., Number Analogy, Word Analogy, SI Units
-        difficulty = data.get("difficulty")
-        title = data.get("title")
-
-        # ---- Real-paper question count (how many each attempt SHOWS) ----
-        # This is the number a student sees per attempt, like a real paper.
-        DEFAULT_COUNTS = {
-            "topic_wise": 12,       # topic test: 10-15 questions
-            "chapter_wise": 20,     # chapter test: ~20-25
-            "subject_wise": 25,     # subject test
-            "full_mock": 100,       # full mock like real SSC
-            "difficulty_wise": 20,
-            "random": 20,
-        }
-        if data.get("count") in (None, "", 0):
-            per_attempt = DEFAULT_COUNTS.get(test_type, 20)
-        else:
-            per_attempt = int(data.get("count"))
-        if test_type == "full_mock":
-            per_attempt = max(10, min(per_attempt, 200))
-        elif test_type == "topic_wise":
-            per_attempt = max(5, min(per_attempt, 15))
-        else:
-            per_attempt = max(5, min(per_attempt, 100))
-
-        # ---- Pool size (how many questions we STORE once, shared by all users) ----
-        # We store a big pool so returning users can get FRESH questions without
-        # any rebuild / AI calls. Pool is capped to keep the DB sane.
-        _MAX_POOL = 500
-        pool_size = min(_MAX_POOL, max(per_attempt, int(data.get("pool_size") or per_attempt * 6)))
-        # This is the number used for FILTERING the file bank below.
-        count = pool_size
-        
-        # Filter questions based on real test logic
-        if test_type == "chapter_wise":
-            filtered = filter_questions(chapter=chapter, difficulty=difficulty, count=count)
-            label = chapter or "Chapter"
-            if not title:
-                title = f"{label} - Chapter Test - {len(filtered)} Qs"
-            desc = f"Chapter wise test: {label} - {len(filtered)} questions from file bank"
-        
-        elif test_type == "topic_wise":
-            filtered = filter_questions(topic=topic, difficulty=difficulty, count=count)
-            label = topic or "Topic"
-            if not title:
-                title = f"{label} - Topic Test - {len(filtered)} Qs"
-            desc = f"Topic wise test: {label} - focused practice"
-        
-        elif test_type == "subject_wise":
-            filtered = filter_questions(subject=subject, difficulty=difficulty, count=count)
-            label = subject or "Subject"
-            if not title:
-                title = f"{label} - Subject Test - {len(filtered)} Qs"
-            desc = f"Subject wise test: {label}"
-        
-        elif test_type == "full_mock":
-            # Full mock: mix of all topics, 100 questions like real SSC
-            filtered = filter_questions(count=count)
-            if not title:
-                title = f"Full Mock Test - {len(filtered)} Qs - Real Exam Pattern"
-            desc = f"Full mock like real SSC - {len(filtered)} questions mixed"
-        
-        elif test_type == "difficulty_wise":
-            filtered = filter_questions(difficulty=difficulty or "medium", count=count)
-            if not title:
-                title = f"{(difficulty or 'medium').title()} Level Test - {len(filtered)} Qs"
-            desc = f"Difficulty wise: {difficulty}"
-        
-        else:  # random
-            filtered = filter_questions(subject=subject, chapter=chapter, topic=topic, difficulty=difficulty, count=count)
-            if not title:
-                title = f"Practice Test - {len(filtered)} Qs"
-            desc = f"Practice test from file bank - {len(filtered)} Qs"
-        
-        if not filtered:
-            stats = get_stats()
-            return jsonify({
-                "error": f"No questions found for filters",
-                "filters": {"test_type": test_type, "subject": subject, "chapter": chapter, "topic": topic, "difficulty": difficulty},
-                "available": stats,
-                "hint": "Try topic='Number Analogy' or chapter='Analogy' or no filters for random"
-            }), 404
-        
-        # Create real exam like SSC pattern.
-        # Duration is based on what a student SEES per attempt (per_attempt),
-        # NOT the whole stored pool.
-        exam = Exam(
-            title=title[:255],
-            description=desc[:1000],
-            duration_seconds=per_attempt * 60,  # 1 min per shown question
-            status="published",
-            exam_mode="mock",
-            default_marks=2,
-            default_negative_marks=0.5
-        )
-        db.session.add(exam)
-        db.session.flush()
-        
-        # Create section
-        section = ExamSection(
-            exam_id=exam.id,
-            title=chapter or topic or subject or "General",
-            order_index=0
-        )
-        db.session.add(section)
-        db.session.flush()
-        
-        # Optional AI fallback for questions with no answer in the file
-        try:
-            from app.services.knowledge_engine.free_ai_chain import derive_answer_with_ai
-            AI_ANSWER_AVAILABLE = True
-        except Exception:
-            AI_ANSWER_AVAILABLE = False
-        ai_has_keys = any([
-            __import__("os").getenv(k) for k in
-            ("GEMINI_API_KEY", "GROQ_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY")
-        ])
-
-        # Add questions to DB and exam
-        added = 0
-        ai_derived = 0
-        skipped_no_answer = 0
-        for idx, fq in enumerate(filtered):
-            try:
-                options = fq.get("options", [])[:4]
-
-                # --- Resolve correct answer: FILE FIRST, then AI ---
-                correct = fq.get("correct_answer")
-                explanation = fq.get("explanation") or ""
-                answer_source = fq.get("answer_source", "file")
-
-                if not correct and AI_ANSWER_AVAILABLE and ai_has_keys:
-                    ai = derive_answer_with_ai(fq["question_text"], options)
-                    if ai:
-                        correct = ai["correct_answer"]
-                        explanation = explanation or ai.get("explanation", "")
-                        answer_source = ai.get("source", "ai")
-                        ai_derived += 1
-
-                # Still no answer -> skip (never guess "A")
-                if not correct:
-                    skipped_no_answer += 1
-                    continue
-                # Ensure the chosen key actually exists among options
-                valid_keys = {str(o.get("option_key", "")).upper() for o in options}
-                if correct not in valid_keys:
-                    skipped_no_answer += 1
-                    continue
-
-                q = Question(
-                    question_text=fq["question_text"][:2000],
-                    question_type="single_choice",
-                    difficulty=fq.get("difficulty","medium") if fq.get("difficulty") in ["easy","medium","hard"] else "medium",
-                    correct_answer=correct,
-                    explanation=explanation[:2000] if explanation else None,
-                    marks=2,
-                    negative_marks=0.5,
-                    is_active=True,
-                    tags=f"{fq.get('subject','')},{fq.get('chapter','')},{fq.get('topic','')},{fq.get('pattern','')},src:{answer_source}"[:512],
-                    source=fq.get("source","file_bank")
-                )
-                db.session.add(q)
-                db.session.flush()
-                
-                from app.models.question import QuestionOption
-                for opt_idx, opt in enumerate(options):
-                    db.session.add(QuestionOption(
-                        question_id=q.id,
-                        option_key=opt.get("option_key","A"),
-                        option_text=opt.get("option_text","")[:500],
-                        order_index=opt_idx
-                    ))
-                
-                db.session.add(ExamQuestion(
-                    exam_id=exam.id,
-                    section_id=section.id,
-                    question_id=q.id,
-                    order_index=added,
-                    marks=2,
-                    negative_marks=0.5
-                ))
-                added += 1
-                
-                # Commit every 20 to avoid memory
-                if added % 20 == 0:
-                    try:
-                        db.session.commit()
-                        db.session.begin()
-                    except Exception:
-                        db.session.rollback()
-                        db.session.begin()
-                        
-            except Exception as e:
-                logger.warning(f"Failed to add file question {idx}: {e}")
-                continue
-        
-        try:
-            db.session.commit()
-        except Exception:
-            db.session.rollback()
-            return jsonify({"error": "Failed to save exam"}), 500
-
-        # Keep exam totals accurate and remember the pool config so each attempt
-        # can draw a real-paper-sized subset (with per-user no-repeat).
-        shown = min(per_attempt, added)
-        try:
-            exam.recalculate_totals()
-            exam.duration_seconds = max(60, shown * 60)  # ~1 min per shown question
-            rules = exam.get_rules() if hasattr(exam, "get_rules") else {}
-            if not isinstance(rules, dict):
-                rules = {}
-            rules["file_bank_source"] = {
-                "test_type": test_type,
-                "subject": subject,
-                "chapter": chapter,
-                "topic": topic,
-                "difficulty": difficulty,
-                "no_repeat_correct": True,
-                "questions_per_attempt": shown,   # what a student sees each attempt
-                "pool_size": added,               # total stored (shared by all users)
-            }
-            exam.set_rules(rules)
-            db.session.commit()
-        except Exception:
-            db.session.rollback()
-
-        if added == 0:
-            return jsonify({
-                "error": "Koi valid answer wale questions nahi mile is filter me.",
-                "hint": "File me answer key honi chahiye, ya AI key (GEMINI_API_KEY/GROQ_API_KEY) set karo taki AI answer nikaale.",
-                "skipped_no_answer": skipped_no_answer,
-                "filters_used": {"test_type": test_type, "subject": subject, "chapter": chapter, "topic": topic, "difficulty": difficulty},
-            }), 404
-
-        return jsonify({
-            "message": f"Real test jaisa ban gaya! {added} questions - {test_type}",
-            "exam_id": exam.id,
-            "exam": exam.to_dict(),
-            "test_type": test_type,
-            "filters_used": {"subject": subject, "chapter": chapter, "topic": topic, "difficulty": difficulty, "count": count},
-            "questions_added": added,
-            "answers_from_file": added - ai_derived,
-            "answers_from_ai": ai_derived,
-            "skipped_no_answer": skipped_no_answer,
-            "stats": get_stats()
-        }), 201
-        
     except Exception as e:
         db.session.rollback()
-        logger.exception("import_from_files failed")
-        return jsonify({"error": str(e)[:800]}), 500
+        return jsonify({"error": str(e)[:300]}), 500
+
+
+@exams_bp.post("/<int:exam_id>/generate-tests")
+@roles_required("admin")
+def generate_tests(exam_id):
+    """Manually re-run auto test generation for one exam (rarely needed;
+    creation + file reload already do this automatically)."""
+    exam = Exam.query.get_or_404(exam_id)
+    try:
+        from app.services.auto_test import generate_tests_for_exam
+        summary = generate_tests_for_exam(exam)
+        return jsonify({"message": "Tests refreshed", **summary})
+    except Exception as e:
+        db.session.rollback()
+        logger.exception("generate_tests failed exam=%s", exam_id)
+        return jsonify({"error": str(e)[:300]}), 500
+
+
+@exams_bp.post("/admin/factory-reset")
+@roles_required("admin")
+def factory_reset():
+    """DANGER: delete ALL exams, tests, attempts and their questions/answers so
+    you can start fresh. Users, subjects and file bank are kept. Also purges any
+    broken (exam_id NULL / orphan) attempt rows. Uses raw SQL to avoid ORM
+    cascade issues on PostgreSQL."""
+    try:
+        from sqlalchemy import text
+        conn = db.session.connection()
+        # Order matters (children before parents); raw SQL bypasses ORM cascade.
+        conn.execute(text("DELETE FROM attempt_answers"))
+        conn.execute(text("DELETE FROM attempts"))
+        conn.execute(text("DELETE FROM exam_questions"))
+        conn.execute(text("DELETE FROM exam_sections"))
+        # questions created by auto/file tests (source marks them) - safe to drop
+        conn.execute(text("DELETE FROM question_options WHERE question_id IN (SELECT id FROM questions WHERE source IS NOT NULL AND source <> '' )"))
+        conn.execute(text("DELETE FROM questions WHERE source IS NOT NULL AND source <> ''"))
+        conn.execute(text("DELETE FROM exams"))
+        db.session.expire_all()
+        db.session.commit()
+        return jsonify({"message": "Factory reset done. Ab exam banao - test apne aap ban jayenge (agar file me questions hain)."})
+    except Exception as e:
+        db.session.rollback()
+        logger.exception("factory_reset failed")
+        return jsonify({"error": str(e)[:300]}), 500

@@ -1,35 +1,37 @@
 """
-Auto test generation (no button needed).
+Exam-driven auto test generation.
 
-Two entry points:
-  * generate_tests_for_bank()          -> called after files are (re)loaded
-  * generate_tests_for_exam(exam)      -> called after an Exam is created
+Rules (agreed with product owner):
+  * NO exam  -> NO test.
+  * Exam created but its syllabus topics have NO questions in the file bank
+    -> exam shows "Coming Soon" (a child placeholder), NO real test.
+  * For each syllabus TOPIC that has questions in files -> a topic test.
+  * For each syllabus CHAPTER that has questions -> a chapter test.
+  * SUBJECT test only when ALL chapters of that subject (that the exam needs and
+    the KB lists) have questions in files.
+  * FULL test only when ALL subjects of the exam are fully covered.
+  * Tests live INSIDE the exam (as child exams), never top-level.
+  * Idempotent: re-running never duplicates (keyed by auto_key in rules).
+  * Token friendly: answers come from files; AI only fills MISSING answers.
 
-Design rules (agreed with product owner):
-  * ONE file = ONE chapter. Subject/chapter come from the file name.
-  * Only build tests for topics/chapters that ACTUALLY have questions in files.
-    A syllabus topic with no questions is skipped silently.
-  * If an exam's syllabus has NO matching questions at all, build NOTHING
-    (user will press "Make test by AI" manually later).
-  * Idempotent: re-running never creates duplicates (keyed by an auto_key
-    stored in the exam rules).
-  * Token friendly: answers come from files; AI is used ONLY as a fallback
-    for missing answers, and syllabus AI-research runs only when there is no
-    description and an AI key exists.
+Public API:
+  * generate_tests_for_exam(exam)      -> build/refresh tests for one exam
+  * refresh_all_exams()                -> re-check every exam (after file upload)
 """
 from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Dict, List, Optional, Set, Tuple
 
 from app.extensions import db
 from app.models.exam import Exam, ExamQuestion, ExamSection
 from app.models.question import Question, QuestionOption
+from app.services import syllabus_kb as kb
 
 logger = logging.getLogger("exam_os.services.auto_test")
 
-# Real-paper "questions shown per attempt" by scope
 PER_ATTEMPT = {
     "topic_wise": 12,
     "chapter_wise": 20,
@@ -37,8 +39,8 @@ PER_ATTEMPT = {
     "full_mock": 100,
 }
 _MAX_POOL = 500
-_MIN_QUESTIONS_FOR_TOPIC = 5      # don't make a test with fewer than this
-_MIN_QUESTIONS_FOR_CHAPTER = 8
+_MIN_TOPIC = 5       # minimum questions to bother making a topic test
+_MIN_CHAPTER = 8
 
 
 def _ai_keys() -> bool:
@@ -47,298 +49,33 @@ def _ai_keys() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Idempotency helpers
+# Idempotency
 # ---------------------------------------------------------------------------
-def _existing_auto_keys(parent_id: Optional[int] = None) -> Set[str]:
-    keys: Set[str] = set()
-    q = Exam.query
-    if parent_id is not None:
-        q = q.filter_by(parent_exam_id=parent_id)
-    for ex in q.all():
+def _auto_key(scope: str, subject: str, chapter: str, topic: str) -> str:
+    return "|".join(x.strip().lower() for x in (scope, subject or "", chapter or "", topic or ""))
+
+
+def _existing_children(exam_id: int) -> Dict[str, Exam]:
+    """Map auto_key -> child Exam for this exam's already-created tests."""
+    out: Dict[str, Exam] = {}
+    for ex in Exam.query.filter_by(parent_exam_id=exam_id).all():
         try:
             rules = ex.get_rules() or {}
-            ak = (rules.get("auto_generated") or {}).get("key")
-            if ak:
-                keys.add(ak)
         except Exception:
-            continue
-    return keys
-
-
-def _make_auto_key(scope: str, subject: str, chapter: str, topic: str, parent_id: Optional[int]) -> str:
-    parts = [str(parent_id or "root"), scope, subject or "", chapter or "", topic or ""]
-    return "|".join(p.strip().lower() for p in parts)
-
-
-# ---------------------------------------------------------------------------
-# Pool test builder (shared, self-contained)
-# ---------------------------------------------------------------------------
-def build_pool_test(
-    *,
-    scope: str,
-    subject: Optional[str] = None,
-    chapter: Optional[str] = None,
-    topic: Optional[str] = None,
-    difficulty: Optional[str] = None,
-    title: Optional[str] = None,
-    description: Optional[str] = None,
-    parent_exam_id: Optional[int] = None,
-    auto_key: Optional[str] = None,
-    use_ai_for_missing: bool = True,
-    commit: bool = True,
-) -> Optional[Exam]:
-    """
-    Create ONE shared pool exam from the file bank. Returns the Exam or None
-    if not enough answerable questions were found. Never guesses answers.
-    """
-    from app.services.file_bank import filter_questions
-
-    per_attempt = PER_ATTEMPT.get(scope, 20)
-    pool_size = min(_MAX_POOL, per_attempt * 6)
-
-    pool = filter_questions(
-        subject=subject, chapter=chapter, topic=topic,
-        difficulty=difficulty, count=pool_size, shuffle=True,
-    )
-    if not pool:
-        return None
-
-    # AI fallback for missing answers (optional)
-    derive = None
-    if use_ai_for_missing and _ai_keys():
-        try:
-            from app.services.knowledge_engine.free_ai_chain import derive_answer_with_ai as derive
-        except Exception:
-            derive = None
-
-    min_needed = _MIN_QUESTIONS_FOR_TOPIC if scope == "topic_wise" else _MIN_QUESTIONS_FOR_CHAPTER
-    if scope in ("subject_wise", "full_mock"):
-        min_needed = _MIN_QUESTIONS_FOR_CHAPTER
-
-    # First, count how many are answerable WITHOUT spending AI, to bail early.
-    answerable = [fq for fq in pool if fq.get("correct_answer")]
-    if len(answerable) < min_needed and not derive:
-        return None
-
-    label = topic or chapter or subject or "Practice"
-    scope_name = {
-        "topic_wise": "Topic Test",
-        "chapter_wise": "Chapter Test",
-        "subject_wise": "Subject Test",
-        "full_mock": "Full Mock",
-    }.get(scope, "Test")
-    if not title:
-        title = f"{label} - {scope_name}"
-    if not description:
-        description = f"Auto-generated {scope.replace('_', ' ')} from file bank: {label}"
-
-    exam = Exam(
-        title=title[:255],
-        description=description[:1000],
-        duration_seconds=per_attempt * 60,
-        status="published",
-        exam_mode="mock",
-        default_marks=2,
-        default_negative_marks=0.5,
-        parent_exam_id=parent_exam_id,
-    )
-    db.session.add(exam)
-    db.session.flush()
-
-    section = ExamSection(exam_id=exam.id, title=chapter or topic or subject or "General", order_index=0)
-    db.session.add(section)
-    db.session.flush()
-
-    added = 0
-    ai_derived = 0
-    for fq in pool:
-        options = fq.get("options", [])[:4]
-        correct = fq.get("correct_answer")
-        explanation = fq.get("explanation") or ""
-        answer_source = fq.get("answer_source", "file")
-
-        if not correct and derive:
-            ai = derive(fq["question_text"], options)
-            if ai:
-                correct = ai["correct_answer"]
-                explanation = explanation or ai.get("explanation", "")
-                answer_source = ai.get("source", "ai")
-                ai_derived += 1
-
-        if not correct:
-            continue
-        valid = {str(o.get("option_key", "")).upper() for o in options}
-        if correct not in valid:
-            continue
-
-        q = Question(
-            question_text=fq["question_text"][:2000],
-            question_type="single_choice",
-            difficulty=fq.get("difficulty", "medium") if fq.get("difficulty") in ("easy", "medium", "hard") else "medium",
-            correct_answer=correct,
-            explanation=explanation[:2000] if explanation else None,
-            marks=2, negative_marks=0.5, is_active=True,
-            tags=f"{fq.get('subject','')},{fq.get('chapter','')},{fq.get('topic','')},src:{answer_source}"[:512],
-            source=fq.get("source", "file_bank"),
-        )
-        db.session.add(q)
-        db.session.flush()
-        for oi, opt in enumerate(options):
-            db.session.add(QuestionOption(
-                question_id=q.id, option_key=opt.get("option_key", "A"),
-                option_text=opt.get("option_text", "")[:500], order_index=oi,
-            ))
-        db.session.add(ExamQuestion(
-            exam_id=exam.id, section_id=section.id, question_id=q.id,
-            order_index=added, marks=2, negative_marks=0.5,
-        ))
-        added += 1
-
-    if added < min_needed:
-        # Not enough -> roll back this exam so we don't leave a stub
-        db.session.rollback()
-        return None
-
-    shown = min(per_attempt, added)
-    exam.recalculate_totals()
-    exam.duration_seconds = max(60, shown * 60)
-    rules = exam.get_rules() or {}
-    rules["file_bank_source"] = {
-        "test_type": scope, "subject": subject, "chapter": chapter, "topic": topic,
-        "difficulty": difficulty, "no_repeat_correct": True,
-        "questions_per_attempt": shown, "pool_size": added,
-    }
-    if auto_key:
-        rules["auto_generated"] = {"key": auto_key, "ai_answers": ai_derived}
-    exam.set_rules(rules)
-
-    if commit:
-        try:
-            db.session.commit()
-        except Exception:
-            db.session.rollback()
-            logger.exception("build_pool_test commit failed")
-            return None
-    return exam
+            rules = {}
+        ak = (rules.get("auto_generated") or {}).get("key")
+        if ak:
+            out[ak] = ex
+    return out
 
 
 # ---------------------------------------------------------------------------
-# Auto-generate from the whole file bank (called after file reload)
+# Syllabus resolution for an exam
 # ---------------------------------------------------------------------------
-def _get_or_create_subject_container(subject: str) -> Exam:
-    """
-    Get (or create) a top-level container exam for a subject, e.g. "Reasoning".
-    All auto-generated chapter/topic/subject tests for that subject become its
-    children, so they show up INSIDE the exam, never as standalone top-level
-    exams in the exams list.
-    """
-    title = f"{subject} - Practice Bank"
-    # Look for an existing container tagged as such
-    for ex in Exam.query.filter_by(parent_exam_id=None).all():
-        try:
-            rules = ex.get_rules() or {}
-            cont = rules.get("auto_container")
-            if cont and str(cont.get("subject", "")).lower() == (subject or "").lower():
-                return ex
-        except Exception:
-            continue
-    # Create new container
-    container = Exam(
-        title=title[:255],
-        description=f"Auto practice bank for {subject}. Chapter / topic / subject tests inside.",
-        duration_seconds=3600,
-        status="published",
-        exam_mode="mock",
-        default_marks=2,
-        default_negative_marks=0.5,
-        parent_exam_id=None,
-    )
-    db.session.add(container)
-    db.session.flush()
-    rules = container.get_rules() or {}
-    rules["auto_container"] = {"subject": subject}
-    container.set_rules(rules)
-    db.session.flush()
-    return container
-
-
-def generate_tests_for_bank(parent_exam_id: Optional[int] = None) -> Dict:
-    """
-    For every subject / chapter / topic that has enough questions in files,
-    create a shared pool test (if it doesn't already exist).
-
-    All tests are placed INSIDE a per-subject container exam so they appear
-    as children (inside the exam), not as standalone top-level exams.
-    """
-    from app.services.file_bank import FILE_QUESTIONS
-    if not FILE_QUESTIONS:
-        return {"created": 0, "skipped": 0, "tests": []}
-
-    created, skipped = 0, 0
-    made: List[Dict] = []
-
-    # Build the (subject, chapter, topic) inventory from files
-    subjects: Set[str] = set()
-    chapters: Set[Tuple[str, str]] = set()
-    topics: Set[Tuple[str, str, str]] = set()
-    for q in FILE_QUESTIONS:
-        s = q.get("subject") or "General"
-        c = q.get("chapter") or "General"
-        t = q.get("topic") or "General"
-        subjects.add(s)
-        chapters.add((s, c))
-        topics.add((s, c, t))
-
-    # One container per subject; cache to avoid duplicate lookups
-    containers: Dict[str, Exam] = {}
-    existing_by_parent: Dict[int, Set[str]] = {}
-
-    def _container_for(subject: str) -> Exam:
-        if subject not in containers:
-            containers[subject] = _get_or_create_subject_container(subject)
-        return containers[subject]
-
-    def _try(scope, subject, chapter, topic):
-        nonlocal created, skipped
-        cont = _container_for(subject or "General")
-        if cont.id not in existing_by_parent:
-            existing_by_parent[cont.id] = _existing_auto_keys(cont.id)
-        key = _make_auto_key(scope, subject or "", chapter or "", topic or "", cont.id)
-        if key in existing_by_parent[cont.id]:
-            skipped += 1
-            return
-        ex = build_pool_test(
-            scope=scope, subject=subject, chapter=chapter, topic=topic,
-            parent_exam_id=cont.id, auto_key=key, commit=True,
-        )
-        if ex:
-            existing_by_parent[cont.id].add(key)
-            created += 1
-            made.append({"exam_id": ex.id, "title": ex.title, "scope": scope, "parent_id": cont.id})
-        else:
-            skipped += 1
-
-    # topic-wise (most specific), then chapter, then subject-wise
-    for (s, c, t) in sorted(topics):
-        _try("topic_wise", s, c, t)
-    for (s, c) in sorted(chapters):
-        _try("chapter_wise", s, c, None)
-    for s in sorted(subjects):
-        _try("subject_wise", s, None, None)
-
-    return {"created": created, "skipped": skipped, "tests": made}
-
-
-# ---------------------------------------------------------------------------
-# Auto-generate for a specific exam (called after Exam is created)
-# ---------------------------------------------------------------------------
-def _syllabus_from_description(text: str) -> List[str]:
-    """Extract candidate chapter/topic names from a free-text description."""
+def _parse_syllabus_terms(text: str) -> List[str]:
     if not text:
         return []
-    import re
-    # split on commas / newlines / semicolons / bullets
-    parts = re.split(r"[,\n;•\-\u2022]| and ", text)
+    parts = re.split(r"[,\n;:•\u2022]|\band\b|\|", text)
     out = []
     for p in parts:
         p = re.sub(r"\s+", " ", p).strip()
@@ -348,130 +85,323 @@ def _syllabus_from_description(text: str) -> List[str]:
 
 
 def _syllabus_from_ai(exam_title: str) -> List[str]:
-    """Best-effort AI syllabus research. Returns chapter/topic name list or []."""
     if not _ai_keys():
         return []
     try:
         import json
         import requests
         key = os.getenv("GEMINI_API_KEY")
-        if key:
-            prompt = (
-                f"List the main topics/chapters in the syllabus of the exam "
-                f"'{exam_title[:120]}'. Return ONLY JSON: {{\"topics\":[\"...\"]}}. "
-                f"Max 40 short topic names. Only JSON."
-            )
-            url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-                   f"gemini-1.5-flash:generateContent?key={key}")
-            r = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=20)
-            if r.status_code == 200:
-                txt = (r.json().get("candidates", [{}])[0].get("content", {})
-                       .get("parts", [{}])[0].get("text", ""))
-                if "{" in txt:
-                    data = json.loads(txt[txt.find("{"):txt.rfind("}") + 1])
-                    return [str(t) for t in (data.get("topics") or [])][:40]
+        if not key:
+            return []
+        prompt = (
+            f"List the exam '{exam_title[:120]}' syllabus as subjects and chapters. "
+            f"Return ONLY JSON: {{\"items\":[\"subject or chapter name\", ...]}}. "
+            f"Max 60 short names. Only JSON."
+        )
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"gemini-1.5-flash:generateContent?key={key}")
+        r = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=20)
+        if r.status_code == 200:
+            txt = (r.json().get("candidates", [{}])[0].get("content", {})
+                   .get("parts", [{}])[0].get("text", ""))
+            if "{" in txt:
+                data = json.loads(txt[txt.find("{"):txt.rfind("}") + 1])
+                return [str(t) for t in (data.get("items") or [])][:60]
     except Exception:
         logger.debug("AI syllabus research failed", exc_info=True)
     return []
 
 
-def generate_tests_for_exam(exam: Exam) -> Dict:
+def resolve_exam_syllabus(exam: Exam) -> Dict:
     """
-    Create child tests under `exam` for every syllabus topic that has questions
-    in the file bank. Topics without questions are skipped silently. If nothing
-    matches, no tests are created (user can 'Make test by AI' manually).
+    Return {"subjects": {subject: [chapters...]}, "source": "description|ai|title"}.
+    Subjects/chapters are canonical (from syllabus_kb).
     """
-    from app.services.file_bank import FILE_QUESTIONS
-    if not FILE_QUESTIONS:
-        return {"created": 0, "skipped": 0, "tests": [], "reason": "no file questions"}
-
-    # 1) Determine syllabus terms: description first, else AI research
-    terms = _syllabus_from_description(exam.description or "")
-    used_ai = False
+    terms = _parse_syllabus_terms(exam.description or "")
+    source = "description"
     if not terms:
         terms = _syllabus_from_ai(exam.title or "")
-        used_ai = bool(terms)
+        source = "ai" if terms else "none"
 
-    # 2) Build available inventory from files
-    inv_topics = {}
-    inv_chapters = {}
-    inv_subjects = set()
+    subjects: Dict[str, Set[str]] = {}
+
+    # If a term is a subject -> include all its KB chapters.
+    # If a term is a chapter -> include that chapter under its subject.
+    for term in terms:
+        subj = kb.canon_subject(term)
+        if subj:
+            subjects.setdefault(subj, set()).update(kb.chapters_for_subject(subj))
+            continue
+        chap = kb.canon_chapter(term)
+        if chap:
+            s = kb.subject_of_chapter(chap)
+            if s:
+                subjects.setdefault(s, set()).add(chap)
+
+    # Fallback: if title mentions a known exam but we found nothing, use a broad
+    # default (SSC-style 4 subjects) so at least structure exists.
+    if not subjects:
+        title = (exam.title or "").lower()
+        if any(k in title for k in ("ssc", "chsl", "cgl", "mts", "clerk", "bank", "railway", "rrb")):
+            for s in ("Reasoning", "Quantitative Aptitude", "English", "General Awareness"):
+                subjects[s] = set(kb.chapters_for_subject(s))
+            source = source if source != "none" else "title"
+
+    return {"subjects": {s: sorted(c) for s, c in subjects.items()}, "source": source}
+
+
+# ---------------------------------------------------------------------------
+# File-bank inventory (what questions actually exist)
+# ---------------------------------------------------------------------------
+def _inventory() -> Dict:
+    """
+    Build canonical inventory from the file bank:
+      topics:   {(subject, chapter, topic): count}
+      chapters: {(subject, chapter): count}
+      subjects: {subject: count}
+    """
+    from app.services.file_bank import FILE_QUESTIONS
+    topics: Dict[Tuple[str, str, str], int] = {}
+    chapters: Dict[Tuple[str, str], int] = {}
+    subjects: Dict[str, int] = {}
     for q in FILE_QUESTIONS:
-        s = q.get("subject") or "General"
-        c = q.get("chapter") or "General"
-        t = q.get("topic") or "General"
-        inv_subjects.add(s)
-        inv_chapters.setdefault((s, c), 0)
-        inv_chapters[(s, c)] += 1
-        inv_topics.setdefault((s, c, t), 0)
-        inv_topics[(s, c, t)] += 1
+        subj = kb.canon_subject(q.get("subject")) or (q.get("subject") or "General")
+        chap = kb.canon_chapter(q.get("chapter")) or (q.get("chapter") or "General")
+        topic = q.get("topic") or chap
+        topics[(subj, chap, topic)] = topics.get((subj, chap, topic), 0) + 1
+        chapters[(subj, chap)] = chapters.get((subj, chap), 0) + 1
+        subjects[subj] = subjects.get(subj, 0) + 1
+    return {"topics": topics, "chapters": chapters, "subjects": subjects}
 
-    existing = _existing_auto_keys(exam.id)
-    created, skipped = 0, 0
+
+# ---------------------------------------------------------------------------
+# Build one pool test (child of the exam)
+# ---------------------------------------------------------------------------
+def _build_test(exam: Exam, scope: str, subject: Optional[str],
+                chapter: Optional[str], topic: Optional[str],
+                auto_key: str, title: str) -> Optional[Exam]:
+    from app.services.file_bank import filter_questions
+
+    per_attempt = PER_ATTEMPT.get(scope, 20)
+    pool_size = min(_MAX_POOL, per_attempt * 6)
+
+    # NOTE: file bank stores original (non-canonical) names; match loosely.
+    pool = filter_questions(subject=subject, chapter=chapter, topic=topic,
+                            count=pool_size, shuffle=True)
+    # canonical safety re-filter
+    def _match(q):
+        if subject and kb.canon_subject(q.get("subject")) != kb.canon_subject(subject):
+            return False
+        if chapter and kb.canon_chapter(q.get("chapter")) != kb.canon_chapter(chapter):
+            return False
+        if topic and (q.get("topic") or "").strip().lower() != topic.strip().lower():
+            return False
+        return True
+    pool = [q for q in pool if _match(q)]
+    if not pool:
+        return None
+
+    derive = None
+    if _ai_keys():
+        try:
+            from app.services.knowledge_engine.free_ai_chain import derive_answer_with_ai as derive
+        except Exception:
+            derive = None
+
+    min_needed = _MIN_TOPIC if scope == "topic_wise" else _MIN_CHAPTER
+    answerable = [q for q in pool if q.get("correct_answer")]
+    if len(answerable) < min_needed and not derive:
+        return None
+
+    exam_obj = Exam(
+        title=title[:255],
+        description=f"Auto {scope.replace('_', ' ')} for {exam.title}",
+        duration_seconds=per_attempt * 60,
+        status="published",
+        exam_mode="mock",
+        default_marks=2,
+        default_negative_marks=0.5,
+        parent_exam_id=exam.id,
+    )
+    db.session.add(exam_obj)
+    db.session.flush()
+
+    section = ExamSection(exam_id=exam_obj.id, title=chapter or topic or subject or "General", order_index=0)
+    db.session.add(section)
+    db.session.flush()
+
+    added = 0
+    ai_used = 0
+    for q in pool:
+        options = q.get("options", [])[:4]
+        correct = q.get("correct_answer")
+        explanation = q.get("explanation") or ""
+        if not correct and derive:
+            ai = derive(q["question_text"], options)
+            if ai:
+                correct = ai["correct_answer"]
+                explanation = explanation or ai.get("explanation", "")
+                ai_used += 1
+        if not correct:
+            continue
+        valid = {str(o.get("option_key", "")).upper() for o in options}
+        if correct not in valid:
+            continue
+        qq = Question(
+            question_text=q["question_text"][:2000],
+            question_type="single_choice",
+            difficulty=q.get("difficulty", "medium") if q.get("difficulty") in ("easy", "medium", "hard") else "medium",
+            correct_answer=correct,
+            explanation=explanation[:2000] if explanation else None,
+            marks=2, negative_marks=0.5, is_active=True,
+            tags=f"{subject or ''},{chapter or ''},{topic or ''}"[:512],
+            source=q.get("source", "file_bank"),
+        )
+        db.session.add(qq)
+        db.session.flush()
+        for oi, opt in enumerate(options):
+            db.session.add(QuestionOption(
+                question_id=qq.id, option_key=opt.get("option_key", "A"),
+                option_text=opt.get("option_text", "")[:500], order_index=oi))
+        db.session.add(ExamQuestion(
+            exam_id=exam_obj.id, section_id=section.id, question_id=qq.id,
+            order_index=added, marks=2, negative_marks=0.5))
+        added += 1
+
+    if added < min_needed:
+        db.session.rollback()
+        return None
+
+    shown = min(per_attempt, added)
+    exam_obj.recalculate_totals()
+    exam_obj.duration_seconds = max(60, shown * 60)
+    rules = exam_obj.get_rules() or {}
+    rules["file_bank_source"] = {
+        "test_type": scope, "subject": subject, "chapter": chapter, "topic": topic,
+        "no_repeat_correct": True, "questions_per_attempt": shown, "pool_size": added,
+    }
+    rules["auto_generated"] = {"key": auto_key, "ai_answers": ai_used}
+    exam_obj.set_rules(rules)
+    db.session.flush()
+    return exam_obj
+
+
+def _set_coming_soon(exam: Exam, on: bool, reason: str = "") -> None:
+    """Mark the parent exam as 'coming soon' (no tests yet) in its rules."""
+    try:
+        rules = exam.get_rules() or {}
+    except Exception:
+        rules = {}
+    rules["coming_soon"] = {"active": bool(on), "reason": reason}
+    exam.set_rules(rules)
+
+
+# ---------------------------------------------------------------------------
+# Main: generate tests for ONE exam
+# ---------------------------------------------------------------------------
+def generate_tests_for_exam(exam: Exam) -> Dict:
+    """
+    Create/refresh tests inside `exam` based on its syllabus + file bank.
+    Returns a summary dict.
+    """
+    if exam is None or exam.parent_exam_id is not None:
+        # Only top-level exams get auto tests (children ARE the tests).
+        return {"created": 0, "skipped": 0, "coming_soon": False, "tests": []}
+
+    syl = resolve_exam_syllabus(exam)
+    inv = _inventory()
+    existing = _existing_children(exam.id)
+
+    created = 0
+    skipped = 0
     made: List[Dict] = []
 
-    def _match(term: str) -> bool:
-        return True  # term matching handled per-candidate below
-
-    def _try(scope, s, c, t, title=None):
+    def _try(scope, subject, chapter, topic, title):
         nonlocal created, skipped
-        key = _make_auto_key(scope, s or "", c or "", t or "", exam.id)
+        key = _auto_key(scope, subject or "", chapter or "", topic or "")
         if key in existing:
             skipped += 1
-            return
-        ex = build_pool_test(
-            scope=scope, subject=s, chapter=c, topic=t,
-            parent_exam_id=exam.id, auto_key=key,
-            title=title, commit=True,
-        )
+            return True  # already exists -> counts as covered
+        ex = _build_test(exam, scope, subject, chapter, topic, key, title)
         if ex:
-            existing.add(key)
+            existing[key] = ex
             created += 1
             made.append({"exam_id": ex.id, "title": ex.title, "scope": scope})
-        else:
-            skipped += 1
-
-    # 3) If we have syllabus terms, only build tests whose chapter/topic/subject
-    #    name matches a term. Otherwise (no desc, no AI) build for everything
-    #    available in files (still only what exists -> skip_silent honored).
-    def term_hits(name: str) -> bool:
-        if not terms:
             return True
-        n = (name or "").lower()
-        for term in terms:
-            tl = term.lower()
-            if tl and (tl in n or n in tl):
-                return True
         return False
 
-    # Count how many distinct chapters each subject actually has in files.
-    chapters_per_subject: Dict[str, Set[str]] = {}
-    for (s, c) in inv_chapters:
-        chapters_per_subject.setdefault(s, set()).add(c)
+    want_subjects = syl["subjects"]  # {subject: [chapters]}
 
-    # topic-wise (always fine — smallest unit)
-    for (s, c, t), cnt in sorted(inv_topics.items()):
-        if term_hits(t) or term_hits(c) or term_hits(s):
-            _try("topic_wise", s, c, t)
+    subject_fully_covered = {}
+    for subject, chapters in want_subjects.items():
+        chapter_covered = {}
+        for chapter in chapters:
+            # topics under this (subject, chapter) that have questions
+            topics_here = [
+                (t, cnt) for (s, c, t), cnt in inv["topics"].items()
+                if s == subject and c == chapter
+            ]
+            chapter_qcount = inv["chapters"].get((subject, chapter), 0)
 
-    # chapter-wise (fine when the chapter has questions)
-    for (s, c), cnt in sorted(inv_chapters.items()):
-        if term_hits(c) or term_hits(s):
-            _try("chapter_wise", s, c, None)
+            # topic tests
+            topic_made_any = False
+            for (t, cnt) in topics_here:
+                if cnt >= _MIN_TOPIC:
+                    ok = _try("topic_wise", subject, chapter, t, f"{t} - Topic Test")
+                    topic_made_any = topic_made_any or ok
 
-    # subject-wise ONLY when the subject has 2+ chapters in files
-    # (ek hi chapter (jaise sirf Analogy) hai to subject test = chapter test,
-    #  isliye alag subject test nahi banate).
-    for s in sorted(inv_subjects):
-        if term_hits(s) and len(chapters_per_subject.get(s, set())) >= 2:
-            _try("subject_wise", s, None, None)
+            # chapter test (if the chapter has enough questions)
+            chapter_made = False
+            if chapter_qcount >= _MIN_CHAPTER:
+                chapter_made = _try("chapter_wise", subject, chapter, None, f"{chapter} - Chapter Test")
 
-    # Full mock ONLY when syllabus spans 2+ subjects with questions
-    # (SSC CHSL me sirf analogy hai to full mock nahi banega).
-    subjects_with_q = {s for s in inv_subjects if term_hits(s)}
-    if made and len(subjects_with_q) >= 2:
-        _try("full_mock", None, None, None, title=f"{exam.title} - Full Mock")
+            chapter_covered[chapter] = bool(chapter_qcount > 0 and (chapter_made or topic_made_any))
 
-    return {"created": created, "skipped": skipped, "tests": made,
-            "syllabus_source": ("ai" if used_ai else ("description" if terms else "all_files")),
-            "syllabus_terms": terms[:40]}
+        # subject test ONLY when ALL chapters of this subject are covered
+        all_ch_covered = len(chapters) > 0 and all(chapter_covered.get(ch, False) for ch in chapters)
+        subject_fully_covered[subject] = all_ch_covered
+        if all_ch_covered:
+            _try("subject_wise", subject, None, None, f"{subject} - Subject Test")
+
+    # full test ONLY when ALL exam subjects are fully covered
+    full_ready = len(want_subjects) > 0 and all(subject_fully_covered.get(s, False) for s in want_subjects)
+    if full_ready:
+        _try("full_mock", None, None, None, f"{exam.title} - Full Test")
+
+    # Coming soon if NOTHING exists for this exam at all
+    total_children = Exam.query.filter_by(parent_exam_id=exam.id).count()
+    coming_soon = total_children == 0
+    _set_coming_soon(exam, coming_soon,
+                     "No questions in file bank for this exam's syllabus yet" if coming_soon else "")
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        logger.exception("generate_tests_for_exam commit failed exam=%s", exam.id)
+        return {"created": 0, "skipped": skipped, "coming_soon": coming_soon,
+                "tests": [], "error": "commit failed"}
+
+    return {
+        "created": created,
+        "skipped": skipped,
+        "coming_soon": coming_soon,
+        "syllabus_source": syl["source"],
+        "subjects": list(want_subjects.keys()),
+        "tests": made,
+    }
+
+
+def refresh_all_exams() -> Dict:
+    """Re-check every top-level exam (call after uploading/reloading files)."""
+    total_created = 0
+    total_coming = 0
+    results = []
+    for exam in Exam.query.filter_by(parent_exam_id=None).all():
+        # skip the seeded demo exam? no—refresh everything top-level
+        r = generate_tests_for_exam(exam)
+        total_created += r.get("created", 0)
+        if r.get("coming_soon"):
+            total_coming += 1
+        results.append({"exam_id": exam.id, "title": exam.title, **{k: r.get(k) for k in ("created", "coming_soon")}})
+    return {"exams_checked": len(results), "tests_created": total_created,
+            "coming_soon_exams": total_coming, "results": results}

@@ -335,9 +335,9 @@ def update_exam(exam_id):
 def delete_exam(exam_id):
     exam = Exam.query.get_or_404(exam_id)
     try:
-        from app.models.attempt import Attempt, AttemptAnswer
+        from sqlalchemy import text
 
-        # Collect this exam AND its child exams (pool tests live as children).
+        # Gather this exam + its child exams (pool tests live as children).
         exam_ids = [exam.id]
         try:
             for child in Exam.query.filter_by(parent_exam_id=exam.id).all():
@@ -345,41 +345,29 @@ def delete_exam(exam_id):
         except Exception:
             pass
 
-        # 1) Delete attempt_answers for all attempts of these exams. These rows
-        #    reference exam_questions via a FK WITHOUT ondelete=CASCADE, so they
-        #    must go first or Postgres blocks the delete (ForeignKeyViolation).
-        attempt_ids = [
-            a.id for a in Attempt.query.filter(Attempt.exam_id.in_(exam_ids)).all()
-        ]
-        if attempt_ids:
-            AttemptAnswer.query.filter(
-                AttemptAnswer.attempt_id.in_(attempt_ids)
-            ).delete(synchronize_session=False)
-            Attempt.query.filter(
-                Attempt.id.in_(attempt_ids)
-            ).delete(synchronize_session=False)
+        # Delete bottom-up with RAW SQL to bypass SQLAlchemy's ORM cascade,
+        # which otherwise tries to UPDATE attempts.exam_id = NULL (the crash).
+        # Order: attempt_answers -> attempts -> exam_questions -> sections -> exams
+        conn = db.session.connection()
+        conn.execute(text("""
+            DELETE FROM attempt_answers
+            WHERE attempt_id IN (SELECT id FROM attempts WHERE exam_id = ANY(:ids))
+        """), {"ids": exam_ids})
+        conn.execute(text("""
+            DELETE FROM attempt_answers
+            WHERE exam_question_id IN (SELECT id FROM exam_questions WHERE exam_id = ANY(:ids))
+        """), {"ids": exam_ids})
+        conn.execute(text("DELETE FROM attempts WHERE exam_id = ANY(:ids)"), {"ids": exam_ids})
+        conn.execute(text("DELETE FROM exam_questions WHERE exam_id = ANY(:ids)"), {"ids": exam_ids})
+        conn.execute(text("DELETE FROM exam_sections WHERE exam_id = ANY(:ids)"), {"ids": exam_ids})
+        # Child exams first, then the parent.
+        child_ids = [i for i in exam_ids if i != exam.id]
+        if child_ids:
+            conn.execute(text("DELETE FROM exams WHERE id = ANY(:ids)"), {"ids": child_ids})
+        conn.execute(text("DELETE FROM exams WHERE id = :id"), {"id": exam.id})
 
-        # 2) Extra safety: null out any stray attempt_answers still pointing at
-        #    this exam's exam_questions (e.g. orphaned rows from older data).
-        try:
-            from app.models.exam import ExamQuestion
-            eq_ids = [
-                eq.id for eq in ExamQuestion.query.filter(
-                    ExamQuestion.exam_id.in_(exam_ids)
-                ).all()
-            ]
-            if eq_ids:
-                AttemptAnswer.query.filter(
-                    AttemptAnswer.exam_question_id.in_(eq_ids)
-                ).update({AttemptAnswer.exam_question_id: None}, synchronize_session=False)
-        except Exception:
-            logger.exception("null-out stray attempt_answers failed exam=%s", exam_id)
-
-        db.session.flush()
-
-        # 3) Now delete the exam. Child exams / sections / exam_questions cascade
-        #    via their ondelete=CASCADE definitions.
-        db.session.delete(exam)
+        # Expire ORM identity map so stale objects aren't re-flushed.
+        db.session.expire_all()
         db.session.commit()
     except Exception:
         db.session.rollback()
@@ -647,11 +635,39 @@ def cleanup_auto_tests():
     subject container).
     """
     try:
-        from app.models.attempt import Attempt
+        from sqlalchemy import text
 
+        conn = db.session.connection()
+
+        # STEP 1 (FIRST, before any ORM query): nuke BROKEN attempts with raw SQL.
+        # A row like (id=1, exam_id=NULL) makes SQLAlchemy autoflush try
+        # 'UPDATE attempts SET exam_id=NULL' and crash every request. Raw SQL
+        # avoids the ORM entirely so we can clean it safely.
+        broken = 0
+        try:
+            res = conn.execute(text("""
+                DELETE FROM attempt_answers
+                WHERE attempt_id IN (
+                    SELECT id FROM attempts
+                    WHERE exam_id IS NULL
+                       OR exam_id NOT IN (SELECT id FROM exams)
+                )
+            """))
+            res2 = conn.execute(text("""
+                DELETE FROM attempts
+                WHERE exam_id IS NULL
+                   OR exam_id NOT IN (SELECT id FROM exams)
+            """))
+            broken = res2.rowcount or 0
+        except Exception:
+            logger.exception("broken-attempt raw cleanup failed")
+
+        # Clear any ORM identity-map state so the next queries are clean.
+        db.session.expire_all()
+
+        # STEP 2: find top-level file-bank tests / old containers to remove.
         removed = []
-        # 1) Remove auto/file-bank tests AND old subject containers that sit at
-        #    top level. Genuinely-manual exams (no file-bank tags) are kept.
+        target_ids = []
         for ex in Exam.query.filter_by(parent_exam_id=None).all():
             try:
                 rules = ex.get_rules() or {}
@@ -661,20 +677,29 @@ def cleanup_auto_tests():
             is_file_bank_test = bool(rules.get("auto_generated")) or bool(rules.get("file_bank_source"))
             if is_file_bank_test or is_container:
                 removed.append({"exam_id": ex.id, "title": ex.title})
-                db.session.delete(ex)
+                target_ids.append(ex.id)
 
-        # 2) Remove BROKEN attempts (exam_id NULL or pointing to a missing exam)
-        #    — these cause the repeating NotNullViolation / stuck-attempt crash.
-        broken = 0
-        try:
-            valid_ids = {e.id for e in Exam.query.with_entities(Exam.id).all()}
-            for att in Attempt.query.all():
-                if att.exam_id is None or att.exam_id not in valid_ids:
-                    db.session.delete(att)
-                    broken += 1
-        except Exception:
-            logger.exception("broken-attempt cleanup skipped")
+        # Include their child exams (pool tests live as children).
+        if target_ids:
+            for child in Exam.query.filter(Exam.parent_exam_id.in_(target_ids)).all():
+                target_ids.append(child.id)
 
+        # STEP 3: delete those exams bottom-up with raw SQL (bypass ORM cascade).
+        if target_ids:
+            conn.execute(text("""
+                DELETE FROM attempt_answers
+                WHERE attempt_id IN (SELECT id FROM attempts WHERE exam_id = ANY(:ids))
+            """), {"ids": target_ids})
+            conn.execute(text("""
+                DELETE FROM attempt_answers
+                WHERE exam_question_id IN (SELECT id FROM exam_questions WHERE exam_id = ANY(:ids))
+            """), {"ids": target_ids})
+            conn.execute(text("DELETE FROM attempts WHERE exam_id = ANY(:ids)"), {"ids": target_ids})
+            conn.execute(text("DELETE FROM exam_questions WHERE exam_id = ANY(:ids)"), {"ids": target_ids})
+            conn.execute(text("DELETE FROM exam_sections WHERE exam_id = ANY(:ids)"), {"ids": target_ids})
+            conn.execute(text("DELETE FROM exams WHERE id = ANY(:ids)"), {"ids": target_ids})
+
+        db.session.expire_all()
         db.session.commit()
         return jsonify({
             "message": f"{len(removed)} purane top-level tests/containers hataye, {broken} toote hue attempts (crash wale) saaf kiye. Ab exam banao (jaise SSC CHSL) — uske andar tests apne aap ban jayenge.",

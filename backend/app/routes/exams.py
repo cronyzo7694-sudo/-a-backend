@@ -698,8 +698,8 @@ def file_bank_reload():
 @exams_bp.post("/<int:exam_id>/generate-tests")
 @roles_required("admin")
 def generate_tests(exam_id):
-    """Manually re-run auto test generation for one exam (rarely needed;
-    creation + file reload already do this automatically)."""
+    """Refresh tests for ONE exam: adds any newly-possible tests from the file
+    bank without touching existing ones. The exam card is always kept."""
     exam = Exam.query.get_or_404(exam_id)
     try:
         from app.services.auto_test import generate_tests_for_exam
@@ -711,13 +711,53 @@ def generate_tests(exam_id):
         return jsonify({"error": str(e)[:300]}), 500
 
 
+@exams_bp.post("/<int:exam_id>/rebuild-tests")
+@roles_required("admin")
+def rebuild_tests(exam_id):
+    """Rebuild tests for ONE exam: clears this exam's tests + their questions,
+    then regenerates from the current file bank. The exam CARD is kept.
+    Other exams are NOT touched. Safe to run anytime."""
+    Exam.query.get_or_404(exam_id)
+    try:
+        from app.services.auto_test import rebuild_exam_tests
+        summary = rebuild_exam_tests(exam_id)
+        return jsonify({"message": "Is exam ke tests dobara ban gaye (exam card safe).", **summary})
+    except Exception as e:
+        db.session.rollback()
+        logger.exception("rebuild_tests failed exam=%s", exam_id)
+        return jsonify({"error": str(e)[:300]}), 500
+
+
+@exams_bp.post("/admin/rebuild-all-tests")
+@roles_required("admin")
+def rebuild_all_tests():
+    """SAFE alternative to factory reset: for every exam, clear its tests and
+    regenerate from files. Exam CARDS, users, and subjects are all KEPT.
+    Use this after adding/updating question files."""
+    try:
+        from app.services.auto_test import rebuild_all_exams
+        summary = rebuild_all_exams()
+        return jsonify({"message": "Sabhi exams ke tests dobara ban gaye. Exam cards safe hain.", **summary})
+    except Exception as e:
+        db.session.rollback()
+        logger.exception("rebuild_all_tests failed")
+        return jsonify({"error": str(e)[:300]}), 500
+
+
 @exams_bp.post("/admin/factory-reset")
 @roles_required("admin")
 def factory_reset():
-    """DANGER: delete ALL exams, tests, attempts and their questions/answers so
-    you can start fresh. Users, subjects and file bank are kept. Also purges any
-    broken (exam_id NULL / orphan) attempt rows. Uses raw SQL to avoid ORM
-    cascade issues on PostgreSQL."""
+    """DANGER: delete ALL exams, tests, attempts, questions, subjects. Requires
+    an explicit confirmation phrase in the body so it can NEVER fire by accident:
+        { "confirm": "DELETE EVERYTHING" }
+    Users and the file bank are kept. For normal cleanup use rebuild-all-tests
+    (which keeps your exam cards)."""
+    data = _json_body()
+    if str(data.get("confirm", "")).strip() != "DELETE EVERYTHING":
+        return jsonify({
+            "error": "Confirmation required",
+            "hint": "Ye sab kuch (saare exams, tests, questions) hata dega. Pakka karne ke liye body me {\"confirm\":\"DELETE EVERYTHING\"} bhejo. Normal safai ke liye 'Rebuild All Tests' use karo (exam cards safe rehte hain).",
+        }), 400
     try:
         from sqlalchemy import text
         conn = db.session.connection()

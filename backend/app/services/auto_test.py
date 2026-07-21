@@ -445,3 +445,86 @@ def refresh_all_exams() -> Dict:
         results.append({"exam_id": exam.id, "title": exam.title, **{k: r.get(k) for k in ("created", "coming_soon")}})
     return {"exams_checked": len(results), "tests_created": total_created,
             "coming_soon_exams": total_coming, "results": results}
+
+
+def clear_exam_tests(exam_id: int) -> Dict:
+    """
+    Delete ONLY the child tests (and their questions/attempts) of one exam.
+    The exam CARD itself is kept. Safe for Postgres (raw SQL, FK order).
+    Returns {"tests_removed": n}.
+    """
+    from sqlalchemy import text, bindparam
+
+    child_ids = [c.id for c in Exam.query.filter_by(parent_exam_id=exam_id).all()]
+    if not child_ids:
+        return {"tests_removed": 0}
+
+    conn = db.session.connection()
+
+    def _run(sql, ids):
+        conn.execute(text(sql).bindparams(bindparam("ids", expanding=True)), {"ids": ids})
+
+    # Collect question ids created for these child tests (to delete cleanly).
+    q_rows = conn.execute(
+        text("SELECT question_id FROM exam_questions WHERE exam_id IN :ids")
+        .bindparams(bindparam("ids", expanding=True)),
+        {"ids": child_ids},
+    ).fetchall()
+    q_ids = [r[0] for r in q_rows if r[0] is not None]
+
+    # Delete bottom-up (bypass ORM cascade -> no exam_id=NULL update crash).
+    _run("DELETE FROM attempt_answers WHERE attempt_id IN "
+         "(SELECT id FROM attempts WHERE exam_id IN :ids)", child_ids)
+    _run("DELETE FROM attempt_answers WHERE exam_question_id IN "
+         "(SELECT id FROM exam_questions WHERE exam_id IN :ids)", child_ids)
+    _run("DELETE FROM attempts WHERE exam_id IN :ids", child_ids)
+    _run("DELETE FROM exam_questions WHERE exam_id IN :ids", child_ids)
+    _run("DELETE FROM exam_sections WHERE exam_id IN :ids", child_ids)
+    _run("DELETE FROM exams WHERE id IN :ids", child_ids)
+    # Remove the now-orphan questions that belonged only to these tests.
+    if q_ids:
+        _run("DELETE FROM question_options WHERE question_id IN :ids", q_ids)
+        _run("DELETE FROM questions WHERE id IN :ids", q_ids)
+
+    db.session.expire_all()
+    return {"tests_removed": len(child_ids)}
+
+
+def rebuild_exam_tests(exam_id: int) -> Dict:
+    """
+    Clear one exam's tests then regenerate them from the current file bank.
+    The exam card is preserved. Ideal for 'refresh this exam after adding files'
+    without touching any other exam.
+    """
+    exam = Exam.query.get(exam_id)
+    if exam is None:
+        return {"error": "exam not found"}
+    lock = _lock_for(exam_id)
+    with lock:
+        cleared = clear_exam_tests(exam_id)
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            logger.exception("rebuild_exam_tests clear-commit failed exam=%s", exam_id)
+        exam = Exam.query.get(exam_id)
+        summary = _generate_tests_for_exam_locked(exam)
+    return {**cleared, **summary}
+
+
+def rebuild_all_exams() -> Dict:
+    """
+    Safe alternative to factory reset: for EVERY exam, clear its tests and
+    regenerate from files. Exam CARDS are kept (no data loss of exams). Users,
+    subjects, and unrelated data are untouched.
+    """
+    results = []
+    total_created = 0
+    for exam in Exam.query.filter_by(parent_exam_id=None).all():
+        r = rebuild_exam_tests(exam.id)
+        total_created += r.get("created", 0)
+        results.append({"exam_id": exam.id, "title": exam.title,
+                        "tests_removed": r.get("tests_removed", 0),
+                        "created": r.get("created", 0),
+                        "coming_soon": r.get("coming_soon")})
+    return {"exams_rebuilt": len(results), "tests_created": total_created, "results": results}

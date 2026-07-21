@@ -213,12 +213,17 @@ def _build_test(exam: Exam, scope: str, subject: Optional[str],
     if len(answerable) < min_needed and not derive:
         return None
 
+    # Auto MODE: if most questions carry a real exam tag (e.g. "SSC MTS 2024"),
+    # this is a Previous Year Questions test -> mode "pyq"; else "mock".
+    pyq_count = sum(1 for q in pool if q.get("exam_hint"))
+    test_mode = "pyq" if pyq_count >= max(3, len(pool) // 2) else "mock"
+
     exam_obj = Exam(
         title=title[:255],
         description=f"Auto {scope.replace('_', ' ')} for {exam.title}",
         duration_seconds=per_attempt * 60,
         status="published",
-        exam_mode="mock",
+        exam_mode=test_mode,
         default_marks=2,
         default_negative_marks=0.5,
         parent_exam_id=exam.id,

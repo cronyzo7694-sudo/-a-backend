@@ -334,8 +334,52 @@ def update_exam(exam_id):
 @roles_required("admin")
 def delete_exam(exam_id):
     exam = Exam.query.get_or_404(exam_id)
-    db.session.delete(exam)
     try:
+        from app.models.attempt import Attempt, AttemptAnswer
+
+        # Collect this exam AND its child exams (pool tests live as children).
+        exam_ids = [exam.id]
+        try:
+            for child in Exam.query.filter_by(parent_exam_id=exam.id).all():
+                exam_ids.append(child.id)
+        except Exception:
+            pass
+
+        # 1) Delete attempt_answers for all attempts of these exams. These rows
+        #    reference exam_questions via a FK WITHOUT ondelete=CASCADE, so they
+        #    must go first or Postgres blocks the delete (ForeignKeyViolation).
+        attempt_ids = [
+            a.id for a in Attempt.query.filter(Attempt.exam_id.in_(exam_ids)).all()
+        ]
+        if attempt_ids:
+            AttemptAnswer.query.filter(
+                AttemptAnswer.attempt_id.in_(attempt_ids)
+            ).delete(synchronize_session=False)
+            Attempt.query.filter(
+                Attempt.id.in_(attempt_ids)
+            ).delete(synchronize_session=False)
+
+        # 2) Extra safety: null out any stray attempt_answers still pointing at
+        #    this exam's exam_questions (e.g. orphaned rows from older data).
+        try:
+            from app.models.exam import ExamQuestion
+            eq_ids = [
+                eq.id for eq in ExamQuestion.query.filter(
+                    ExamQuestion.exam_id.in_(exam_ids)
+                ).all()
+            ]
+            if eq_ids:
+                AttemptAnswer.query.filter(
+                    AttemptAnswer.exam_question_id.in_(eq_ids)
+                ).update({AttemptAnswer.exam_question_id: None}, synchronize_session=False)
+        except Exception:
+            logger.exception("null-out stray attempt_answers failed exam=%s", exam_id)
+
+        db.session.flush()
+
+        # 3) Now delete the exam. Child exams / sections / exam_questions cascade
+        #    via their ondelete=CASCADE definitions.
+        db.session.delete(exam)
         db.session.commit()
     except Exception:
         db.session.rollback()

@@ -593,6 +593,39 @@ def make_tests_by_ai(exam_id):
         return jsonify({"error": str(e)[:300]}), 500
 
 
+@exams_bp.post("/file-bank/cleanup-auto")
+@roles_required("admin")
+def cleanup_auto_tests():
+    """
+    Delete previously auto-generated tests that were wrongly created as
+    top-level (standalone) exams. Keeps manual exams and subject containers.
+    Use this once, then run reload to regenerate them correctly (inside a
+    subject container).
+    """
+    try:
+        removed = []
+        for ex in Exam.query.filter_by(parent_exam_id=None).all():
+            try:
+                rules = ex.get_rules() or {}
+            except Exception:
+                rules = {}
+            # Only remove standalone auto-generated pool tests, NOT containers
+            # and NOT manually-created exams.
+            is_auto = bool(rules.get("auto_generated"))
+            is_container = bool(rules.get("auto_container"))
+            if is_auto and not is_container:
+                removed.append({"exam_id": ex.id, "title": ex.title})
+                db.session.delete(ex)
+        db.session.commit()
+        return jsonify({
+            "message": f"{len(removed)} galat top-level auto-tests hataye. Ab 'Reload & Auto-Generate' dabao — sahi jagah (exam ke andar) ban jayenge.",
+            "removed": removed,
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)[:300]}), 500
+
+
 @exams_bp.post("/file-bank/reload")
 @roles_required("admin")
 def file_bank_reload():

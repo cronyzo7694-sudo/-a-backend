@@ -225,16 +225,55 @@ def build_pool_test(
 # ---------------------------------------------------------------------------
 # Auto-generate from the whole file bank (called after file reload)
 # ---------------------------------------------------------------------------
+def _get_or_create_subject_container(subject: str) -> Exam:
+    """
+    Get (or create) a top-level container exam for a subject, e.g. "Reasoning".
+    All auto-generated chapter/topic/subject tests for that subject become its
+    children, so they show up INSIDE the exam, never as standalone top-level
+    exams in the exams list.
+    """
+    title = f"{subject} - Practice Bank"
+    # Look for an existing container tagged as such
+    for ex in Exam.query.filter_by(parent_exam_id=None).all():
+        try:
+            rules = ex.get_rules() or {}
+            cont = rules.get("auto_container")
+            if cont and str(cont.get("subject", "")).lower() == (subject or "").lower():
+                return ex
+        except Exception:
+            continue
+    # Create new container
+    container = Exam(
+        title=title[:255],
+        description=f"Auto practice bank for {subject}. Chapter / topic / subject tests inside.",
+        duration_seconds=3600,
+        status="published",
+        exam_mode="mock",
+        default_marks=2,
+        default_negative_marks=0.5,
+        parent_exam_id=None,
+    )
+    db.session.add(container)
+    db.session.flush()
+    rules = container.get_rules() or {}
+    rules["auto_container"] = {"subject": subject}
+    container.set_rules(rules)
+    db.session.flush()
+    return container
+
+
 def generate_tests_for_bank(parent_exam_id: Optional[int] = None) -> Dict:
     """
     For every subject / chapter / topic that has enough questions in files,
     create a shared pool test (if it doesn't already exist).
+
+    All tests are placed INSIDE a per-subject container exam so they appear
+    as children (inside the exam), not as standalone top-level exams.
     """
     from app.services.file_bank import FILE_QUESTIONS
     if not FILE_QUESTIONS:
         return {"created": 0, "skipped": 0, "tests": []}
 
-    existing = _existing_auto_keys(parent_exam_id)
     created, skipped = 0, 0
     made: List[Dict] = []
 
@@ -250,32 +289,42 @@ def generate_tests_for_bank(parent_exam_id: Optional[int] = None) -> Dict:
         chapters.add((s, c))
         topics.add((s, c, t))
 
+    # One container per subject; cache to avoid duplicate lookups
+    containers: Dict[str, Exam] = {}
+    existing_by_parent: Dict[int, Set[str]] = {}
+
+    def _container_for(subject: str) -> Exam:
+        if subject not in containers:
+            containers[subject] = _get_or_create_subject_container(subject)
+        return containers[subject]
+
     def _try(scope, subject, chapter, topic):
         nonlocal created, skipped
-        key = _make_auto_key(scope, subject or "", chapter or "", topic or "", parent_exam_id)
-        if key in existing:
+        cont = _container_for(subject or "General")
+        if cont.id not in existing_by_parent:
+            existing_by_parent[cont.id] = _existing_auto_keys(cont.id)
+        key = _make_auto_key(scope, subject or "", chapter or "", topic or "", cont.id)
+        if key in existing_by_parent[cont.id]:
             skipped += 1
             return
         ex = build_pool_test(
             scope=scope, subject=subject, chapter=chapter, topic=topic,
-            parent_exam_id=parent_exam_id, auto_key=key, commit=True,
+            parent_exam_id=cont.id, auto_key=key, commit=True,
         )
         if ex:
-            existing.add(key)
+            existing_by_parent[cont.id].add(key)
             created += 1
-            made.append({"exam_id": ex.id, "title": ex.title, "scope": scope})
+            made.append({"exam_id": ex.id, "title": ex.title, "scope": scope, "parent_id": cont.id})
         else:
             skipped += 1
 
-    # topic-wise (most specific), then chapter, then subject, then full mock
+    # topic-wise (most specific), then chapter, then subject-wise
     for (s, c, t) in sorted(topics):
         _try("topic_wise", s, c, t)
     for (s, c) in sorted(chapters):
         _try("chapter_wise", s, c, None)
     for s in sorted(subjects):
         _try("subject_wise", s, None, None)
-    # one full mock across everything
-    _try("full_mock", None, None, None)
 
     return {"created": created, "skipped": skipped, "tests": made}
 

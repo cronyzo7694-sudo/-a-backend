@@ -603,25 +603,39 @@ def cleanup_auto_tests():
     subject container).
     """
     try:
+        from app.models.attempt import Attempt
+
         removed = []
+        # 1) Remove auto/file-bank tests AND old subject containers that sit at
+        #    top level. Genuinely-manual exams (no file-bank tags) are kept.
         for ex in Exam.query.filter_by(parent_exam_id=None).all():
             try:
                 rules = ex.get_rules() or {}
             except Exception:
                 rules = {}
             is_container = bool(rules.get("auto_container"))
-            # A file-bank test has either an auto_generated tag OR a
-            # file_bank_source config (older tests). Remove those top-level ones
-            # so they can be regenerated inside a subject container. Keep
-            # containers and genuinely-manual exams.
             is_file_bank_test = bool(rules.get("auto_generated")) or bool(rules.get("file_bank_source"))
-            if is_file_bank_test and not is_container:
+            if is_file_bank_test or is_container:
                 removed.append({"exam_id": ex.id, "title": ex.title})
                 db.session.delete(ex)
+
+        # 2) Remove BROKEN attempts (exam_id NULL or pointing to a missing exam)
+        #    — these cause the repeating NotNullViolation / stuck-attempt crash.
+        broken = 0
+        try:
+            valid_ids = {e.id for e in Exam.query.with_entities(Exam.id).all()}
+            for att in Attempt.query.all():
+                if att.exam_id is None or att.exam_id not in valid_ids:
+                    db.session.delete(att)
+                    broken += 1
+        except Exception:
+            logger.exception("broken-attempt cleanup skipped")
+
         db.session.commit()
         return jsonify({
-            "message": f"{len(removed)} galat top-level auto-tests hataye. Ab 'Reload & Auto-Generate' dabao — sahi jagah (exam ke andar) ban jayenge.",
+            "message": f"{len(removed)} purane top-level tests/containers hataye, {broken} toote hue attempts (crash wale) saaf kiye. Ab exam banao (jaise SSC CHSL) — uske andar tests apne aap ban jayenge.",
             "removed": removed,
+            "broken_attempts_removed": broken,
         })
     except Exception as e:
         db.session.rollback()
@@ -635,19 +649,14 @@ def file_bank_reload():
     try:
         from app.services.file_bank import reload_file_bank, get_stats
         n = reload_file_bank()
-        auto_summary = None
-        # After new files load, auto-build standalone tests for the new content.
-        if request.args.get("auto", "true").lower() != "false":
-            try:
-                from app.services.auto_test import generate_tests_for_bank
-                auto_summary = generate_tests_for_bank()
-            except Exception:
-                logger.exception("auto test generation after reload failed")
+        # NOTE: file reload only refreshes the question bank. Tests are NOT
+        # created here anymore — tests are created INSIDE an exam when you add
+        # an exam (SSC CHSL etc.). This keeps the exams list clean.
         return jsonify({
-            "message": f"File bank reloaded - {n} questions",
+            "message": f"File bank reloaded - {n} questions. Ab exam banao (jaise SSC CHSL), uske andar tests apne aap ban jayenge.",
             "total": n,
             "stats": get_stats(),
-            "auto_tests": auto_summary,
+            "auto_tests": None,
         })
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 500

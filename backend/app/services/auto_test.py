@@ -444,18 +444,32 @@ def generate_tests_for_exam(exam: Exam) -> Dict:
                 return True
         return False
 
+    # Count how many distinct chapters each subject actually has in files.
+    chapters_per_subject: Dict[str, Set[str]] = {}
+    for (s, c) in inv_chapters:
+        chapters_per_subject.setdefault(s, set()).add(c)
+
+    # topic-wise (always fine — smallest unit)
     for (s, c, t), cnt in sorted(inv_topics.items()):
         if term_hits(t) or term_hits(c) or term_hits(s):
             _try("topic_wise", s, c, t)
+
+    # chapter-wise (fine when the chapter has questions)
     for (s, c), cnt in sorted(inv_chapters.items()):
         if term_hits(c) or term_hits(s):
             _try("chapter_wise", s, c, None)
+
+    # subject-wise ONLY when the subject has 2+ chapters in files
+    # (ek hi chapter (jaise sirf Analogy) hai to subject test = chapter test,
+    #  isliye alag subject test nahi banate).
     for s in sorted(inv_subjects):
-        if term_hits(s):
+        if term_hits(s) and len(chapters_per_subject.get(s, set())) >= 2:
             _try("subject_wise", s, None, None)
 
-    # Full mock only if at least something matched
-    if made:
+    # Full mock ONLY when syllabus spans 2+ subjects with questions
+    # (SSC CHSL me sirf analogy hai to full mock nahi banega).
+    subjects_with_q = {s for s in inv_subjects if term_hits(s)}
+    if made and len(subjects_with_q) >= 2:
         _try("full_mock", None, None, None, title=f"{exam.title} - Full Mock")
 
     return {"created": created, "skipped": skipped, "tests": made,

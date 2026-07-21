@@ -61,8 +61,17 @@ def _has_ai_keys():
 
 
 def smart_classify(question_text, options=None):
+    """
+    Classify a question into subject/chapter/topic.
+
+    IMPORTANT (token saving): this runs for EVERY question at file-load time.
+    So by default it uses ONLY the local heuristic (zero API cost).
+    AI classification is opt-in via env FILE_BANK_AI_CLASSIFY=1 for people who
+    want higher accuracy and don't mind spending free-tier quota once.
+    """
     options = options or []
-    if FREE_AI_AVAILABLE and _has_ai_keys():
+    use_ai = os.getenv("FILE_BANK_AI_CLASSIFY", "").lower() in ("1", "true", "yes", "on")
+    if use_ai and FREE_AI_AVAILABLE and _has_ai_keys():
         try:
             ai_result = classify_with_free_ai_chain(question_text, local_classify)
             if ai_result and ai_result.get("subject"):

@@ -75,11 +75,22 @@ def _build_player_payload(attempt: Attempt, exam: Exam) -> Dict[str, Any]:
     """Assemble exam player payload without leaking correct answers."""
     rules = ExamRuleEngine.from_exam(exam)
     sections_out: List[Dict[str, Any]] = []
-    all_eqs = (
+
+    answer_map = {a.question_id: a for a in attempt.answers.all()}
+
+    all_eqs_full = (
         ExamQuestion.query.filter_by(exam_id=exam.id)
         .order_by(ExamQuestion.order_index)
         .all()
     )
+    # Restrict the player to the questions assigned to THIS attempt (pool exams
+    # give each attempt a subset). Fall back to all if answers not yet created.
+    if answer_map:
+        all_eqs = [eq for eq in all_eqs_full if eq.question_id in answer_map]
+        if not all_eqs:
+            all_eqs = all_eqs_full
+    else:
+        all_eqs = all_eqs_full
 
     by_section: Dict[Any, List[ExamQuestion]] = {}
     unsectioned: List[ExamQuestion] = []
@@ -88,8 +99,6 @@ def _build_player_payload(attempt: Attempt, exam: Exam) -> Dict[str, Any]:
             by_section.setdefault(eq.section_id, []).append(eq)
         else:
             unsectioned.append(eq)
-
-    answer_map = {a.question_id: a for a in attempt.answers.all()}
     do_shuffle_opts = rules.shuffle_options()
     do_shuffle_qs = rules.shuffle_questions()
     mandatory = set(rules.mandatory_question_ids())
@@ -206,12 +215,22 @@ def _build_player_payload(attempt: Attempt, exam: Exam) -> Dict[str, Any]:
 
 
 def _evaluate_attempt(attempt: Attempt, exam: Exam) -> None:
-    eqs = {
+    # Only score the questions actually assigned to THIS attempt (supports
+    # file-bank pool exams where an attempt uses a subset of the pool).
+    answers = list(attempt.answers.all())
+    answer_by_q = {a.question_id: a for a in answers}
+
+    all_exam_eqs = {
         eq.question_id: eq
         for eq in ExamQuestion.query.filter_by(exam_id=exam.id).all()
     }
-    answers = list(attempt.answers.all())
-    answer_by_q = {a.question_id: a for a in answers}
+    if answer_by_q:
+        eqs = {qid: all_exam_eqs[qid] for qid in answer_by_q if qid in all_exam_eqs}
+        # Include any answer rows whose exam_question mapping is missing but valid
+        if not eqs:
+            eqs = all_exam_eqs
+    else:
+        eqs = all_exam_eqs
 
     for qid, eq in eqs.items():
         if qid not in answer_by_q:
@@ -389,21 +408,6 @@ def start_attempt():
     if (exam.total_questions or 0) < 1:
         return jsonify({"error": "Exam has no questions"}), 400
 
-    # No-repeat: if this is a file-bank test and the user has mastered some
-    # questions before, refill the exam with FRESH questions of the same topic.
-    try:
-        has_active = Attempt.query.filter_by(
-            exam_id=exam.id, user_id=user_id, status="in_progress"
-        ).first()
-        if not has_active:
-            from app.services.exam_builder import rebuild_file_bank_exam
-            rebuild_file_bank_exam(exam, user_id)
-            db.session.commit()
-            exam.recalculate_totals()
-    except Exception:
-        db.session.rollback()
-        logger.exception("file-bank rebuild skipped for exam=%s", exam.id)
-
     rules = ExamRuleEngine.from_exam(exam)
 
     # Attempt limit from configuration (0 = unlimited)
@@ -439,6 +443,25 @@ def start_attempt():
     if duration < 1:
         duration = 3600
 
+    # Pick the questions for THIS attempt. For file-bank "pool" exams this
+    # returns a real-paper-sized subset that excludes questions the user has
+    # already answered correctly (no-repeat, zero AI cost). For normal exams it
+    # returns all questions unchanged.
+    try:
+        from app.services.exam_builder import select_attempt_questions
+        selected_eqs = select_attempt_questions(exam, user_id)
+    except Exception:
+        logger.exception("select_attempt_questions failed exam=%s", exam.id)
+        selected_eqs = ExamQuestion.query.filter_by(exam_id=exam.id).all()
+
+    selected_count = len(selected_eqs)
+    selected_marks = 0.0
+    for eq in selected_eqs:
+        try:
+            selected_marks += float(eq.marks or 0)
+        except (TypeError, ValueError):
+            pass
+
     attempt = Attempt(
         exam_id=exam.id,
         user_id=user_id,
@@ -446,13 +469,13 @@ def start_attempt():
         started_at=now,
         expires_at=now + timedelta(seconds=duration),
         duration_seconds=duration,
-        total_questions=exam.total_questions,
-        max_score=exam.total_marks,
+        total_questions=selected_count or exam.total_questions,
+        max_score=selected_marks or exam.total_marks,
     )
     db.session.add(attempt)
     db.session.flush()
 
-    for eq in ExamQuestion.query.filter_by(exam_id=exam.id).all():
+    for eq in selected_eqs:
         db.session.add(
             AttemptAnswer(
                 attempt_id=attempt.id,
@@ -807,12 +830,16 @@ def get_review(attempt_id):
     show_answers = rules.get("result.show_correct_answers", True)
     show_expl = rules.get("result.show_explanations", True)
 
-    eqs = (
+    answer_map = {a.question_id: a for a in attempt.answers.all()}
+    eqs_full = (
         ExamQuestion.query.filter_by(exam_id=exam.id)
         .order_by(ExamQuestion.order_index)
         .all()
     )
-    answer_map = {a.question_id: a for a in attempt.answers.all()}
+    # Review only the questions this attempt actually used (pool subset).
+    eqs = [eq for eq in eqs_full if eq.question_id in answer_map] if answer_map else eqs_full
+    if not eqs:
+        eqs = eqs_full
     items = []
     for eq in eqs:
         a = answer_map.get(eq.question_id)

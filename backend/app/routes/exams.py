@@ -539,11 +539,12 @@ def unpublish_exam(exam_id):
 @jwt_required()
 def file_bank_stats():
     try:
-        from app.services.file_bank import get_stats, FILE_QUESTIONS
+        from app.services import file_bank as _fb
+        from app.services.file_bank import get_stats
         stats = get_stats()
         return jsonify({
             "message": "File bank stats - real test jaisa",
-            "total_file_questions": len(FILE_QUESTIONS),
+            "total_file_questions": len(_fb.FILE_QUESTIONS),
             "stats": stats,
             "available_test_types": ["chapter_wise", "topic_wise", "subject_wise", "full_mock", "pyq", "difficulty_wise", "random"],
             "example": {
@@ -553,6 +554,17 @@ def file_bank_stats():
                 "full_mock": "Full 100 questions mock like real SSC"
             }
         })
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 500
+
+@exams_bp.post("/file-bank/reload")
+@roles_required("admin")
+def file_bank_reload():
+    """Re-scan the questions_data folder after adding/updating .txt files."""
+    try:
+        from app.services.file_bank import reload_file_bank, get_stats
+        n = reload_file_bank()
+        return jsonify({"message": f"File bank reloaded - {n} questions", "total": n, "stats": get_stats()})
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 500
 
@@ -611,7 +623,8 @@ def import_from_files():
         difficulty = data.get("difficulty")
         title = data.get("title")
 
-        # Real-paper default counts per test type (used when caller omits count)
+        # ---- Real-paper question count (how many each attempt SHOWS) ----
+        # This is the number a student sees per attempt, like a real paper.
         DEFAULT_COUNTS = {
             "topic_wise": 12,       # topic test: 10-15 questions
             "chapter_wise": 20,     # chapter test: ~20-25
@@ -621,16 +634,23 @@ def import_from_files():
             "random": 20,
         }
         if data.get("count") in (None, "", 0):
-            count = DEFAULT_COUNTS.get(test_type, 20)
+            per_attempt = DEFAULT_COUNTS.get(test_type, 20)
         else:
-            count = int(data.get("count"))
-        # Full mock can be large; others capped to sensible real-paper sizes
+            per_attempt = int(data.get("count"))
         if test_type == "full_mock":
-            count = max(10, min(count, 200))
+            per_attempt = max(10, min(per_attempt, 200))
         elif test_type == "topic_wise":
-            count = max(5, min(count, 15))
+            per_attempt = max(5, min(per_attempt, 15))
         else:
-            count = max(5, min(count, 100))
+            per_attempt = max(5, min(per_attempt, 100))
+
+        # ---- Pool size (how many questions we STORE once, shared by all users) ----
+        # We store a big pool so returning users can get FRESH questions without
+        # any rebuild / AI calls. Pool is capped to keep the DB sane.
+        _MAX_POOL = 500
+        pool_size = min(_MAX_POOL, max(per_attempt, int(data.get("pool_size") or per_attempt * 6)))
+        # This is the number used for FILTERING the file bank below.
+        count = pool_size
         
         # Filter questions based on real test logic
         if test_type == "chapter_wise":
@@ -682,11 +702,13 @@ def import_from_files():
                 "hint": "Try topic='Number Analogy' or chapter='Analogy' or no filters for random"
             }), 404
         
-        # Create real exam like SSC pattern
+        # Create real exam like SSC pattern.
+        # Duration is based on what a student SEES per attempt (per_attempt),
+        # NOT the whole stored pool.
         exam = Exam(
             title=title[:255],
             description=desc[:1000],
-            duration_seconds=count * 60,  # 1 min per question like real exam
+            duration_seconds=per_attempt * 60,  # 1 min per shown question
             status="published",
             exam_mode="mock",
             default_marks=2,
@@ -799,11 +821,12 @@ def import_from_files():
             db.session.rollback()
             return jsonify({"error": "Failed to save exam"}), 500
 
-        # Keep exam totals (total_questions / total_marks / duration) accurate
-        # and remember the file-bank filter so re-attempts can pull FRESH questions.
+        # Keep exam totals accurate and remember the pool config so each attempt
+        # can draw a real-paper-sized subset (with per-user no-repeat).
+        shown = min(per_attempt, added)
         try:
             exam.recalculate_totals()
-            exam.duration_seconds = max(60, added * 60)  # ~1 min per question
+            exam.duration_seconds = max(60, shown * 60)  # ~1 min per shown question
             rules = exam.get_rules() if hasattr(exam, "get_rules") else {}
             if not isinstance(rules, dict):
                 rules = {}
@@ -814,6 +837,8 @@ def import_from_files():
                 "topic": topic,
                 "difficulty": difficulty,
                 "no_repeat_correct": True,
+                "questions_per_attempt": shown,   # what a student sees each attempt
+                "pool_size": added,               # total stored (shared by all users)
             }
             exam.set_rules(rules)
             db.session.commit()

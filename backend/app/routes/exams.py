@@ -119,7 +119,10 @@ def list_exams():
         .all()
     )
     def _item(e):
-        d = e.to_dict(include_sections=True)
+        # List view only needs summary fields — NOT sections/questions.
+        # Loading sections here caused huge JOINs (sections->exam_questions->
+        # questions->options) and made the list slow under load.
+        d = e.to_dict(include_sections=False)
         try:
             cs = (e.get_rules() or {}).get("coming_soon") or {}
             d["coming_soon"] = bool(cs.get("active"))
@@ -151,7 +154,17 @@ def get_exam(exam_id):
             children_q = children_q.filter_by(status="published")
         children = children_q.order_by(Exam.id.desc()).all()
         if children:
-            data["children"] = [c.to_dict(include_sections=True) for c in children]
+            # Child cards need summary only; skip sections for speed.
+            child_list = []
+            for c in children:
+                cd = c.to_dict(include_sections=False)
+                try:
+                    ccs = (c.get_rules() or {}).get("coming_soon") or {}
+                    cd["coming_soon"] = bool(ccs.get("active"))
+                except Exception:
+                    cd["coming_soon"] = False
+                child_list.append(cd)
+            data["children"] = child_list
     if include_q and claims.get("role") != "admin":
         _strip_answers_from_exam_dict(data)
     # Additive: resolved rule pack for clients (backward compatible)

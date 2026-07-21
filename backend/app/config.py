@@ -312,13 +312,14 @@ def _build_engine_options(database_uri: str) -> dict:
             minimum=30,
             maximum=3600,
         )
-        # Only set size knobs when explicitly provided (avoid surprising SA)
-        pool_size = os.getenv("DB_POOL_SIZE")
-        if pool_size is not None:
-            options["pool_size"] = _env_int("DB_POOL_SIZE", 5, minimum=1, maximum=50)
-        max_overflow = os.getenv("DB_MAX_OVERFLOW")
-        if max_overflow is not None:
-            options["max_overflow"] = _env_int("DB_MAX_OVERFLOW", 10, minimum=0, maximum=100)
+        # Sensible defaults so a threaded gunicorn worker (gthread, ~8 threads)
+        # never starves for DB connections under an exam-start rush. Each worker
+        # process gets its own pool; keep per-worker modest to fit Postgres/Neon
+        # connection limits. Override via env when scaling.
+        options["pool_size"] = _env_int("DB_POOL_SIZE", 10, minimum=1, maximum=50)
+        options["max_overflow"] = _env_int("DB_MAX_OVERFLOW", 10, minimum=0, maximum=100)
+        # Don't hang forever waiting for a connection; fail fast and retry.
+        options["pool_timeout"] = _env_int("DB_POOL_TIMEOUT", 10, minimum=1, maximum=60)
     elif _is_sqlite_url(database_uri):
         # check_same_thread left default — Flask-SQLAlchemy scoped sessions
         # already serialize access per request context in typical deployments.

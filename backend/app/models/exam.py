@@ -247,7 +247,7 @@ class ExamSection(db.Model):
         back_populates="section",
         cascade="all, delete-orphan",
         order_by="ExamQuestion.order_index",
-        lazy="joined",
+        lazy="select",
     )
 
     def to_dict(self, include_questions: bool = False) -> Dict[str, Any]:
@@ -301,7 +301,7 @@ class ExamQuestion(db.Model):
 
     exam = db.relationship("Exam", back_populates="exam_questions")
     section = db.relationship("ExamSection", back_populates="exam_questions")
-    question = db.relationship("Question", lazy="joined")
+    question = db.relationship("Question", lazy="select")
 
     __table_args__ = (
         db.UniqueConstraint("exam_id", "question_id", name="uq_exam_question"),

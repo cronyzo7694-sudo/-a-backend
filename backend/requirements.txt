@@ -30,6 +30,9 @@ python-dateutil==2.9.0.post0
 gunicorn==23.0.0
 packaging==24.1
 
+# --- HTTP client (AI translate / explanation / answer derivation) ---
+requests==2.32.3
+
 # --- Optional serialization helpers (available for future DTO layer) ---
 marshmallow==3.23.1
 

@@ -69,7 +69,10 @@ def build_attempt_analytics(attempt: Attempt) -> Dict[str, Any]:
         s.id: s for s in (exam.sections if exam else [])
     }
 
-    total = len(eqs) or attempt.total_questions or 0
+    # IMPORTANT: analyse ONLY the questions this attempt actually used (its
+    # AttemptAnswer rows), NOT the whole shared pool. Otherwise a 20-question
+    # paper drawn from a 120-question pool wrongly showed ~100 "skipped".
+    total = len(answers) or attempt.total_questions or 0
     correct = int(attempt.correct_count or 0)
     wrong = int(attempt.wrong_count or 0)
     skipped = int(attempt.skipped_count or 0)
@@ -110,13 +113,15 @@ def build_attempt_analytics(attempt: Attempt) -> Dict[str, Any]:
 
     ans_by_q = {a.question_id: a for a in answers}
 
-    for qid, eq in eqs.items():
-        a = ans_by_q.get(qid)
-        q = eq.question or (a.question if a else None) or Question.query.get(qid)
+    # Iterate over THIS attempt's answers only (not the whole pool).
+    for a in answers:
+        qid = a.question_id
+        eq = eqs.get(qid)
+        q = (eq.question if eq else None) or a.question or Question.query.get(qid)
         t = int(a.time_spent_seconds or 0) if a else 0
         times.append(t)
-        marks = float(eq.marks or 0)
-        neg = float(eq.negative_marks or 0)
+        marks = float((eq.marks if eq else None) or 2)
+        neg = float((eq.negative_marks if eq else None) or 0)
 
         subj = "Unknown"
         chap = "Unknown"
@@ -132,10 +137,11 @@ def build_attempt_analytics(attempt: Attempt) -> Dict[str, Any]:
                 chap = f"chapter:{getattr(q, 'chapter_id', None)}"
             diff = (q.difficulty or "medium").lower()
 
-        sec_key = str(eq.section_id or "none")
+        sec_id = (eq.section_id if eq else None) or (a.section_id if a else None)
+        sec_key = str(sec_id or "none")
         sec_title = ""
-        if eq.section_id and eq.section_id in sections:
-            sec_title = sections[eq.section_id].title
+        if sec_id and sec_id in sections:
+            sec_title = sections[sec_id].title
         by_section[sec_key]["title"] = sec_title or sec_key
         by_section[sec_key]["max_score"] += marks
         by_section[sec_key]["time"] += t

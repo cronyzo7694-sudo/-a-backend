@@ -1039,3 +1039,54 @@ def translate_question(question_id):
         ],
         "translated": have_all_hi is False,
     })
+
+
+@attempts_bp.post("/questions/<int:question_id>/explanation")
+@jwt_required()
+def question_explanation(question_id):
+    """
+    Return the explanation for a question in the requested language.
+    * If the file already has an explanation, use it (English) and its Hindi if
+      present. * If missing, generate ONCE with AI (bound to THIS question +
+      its correct answer, so it can never belong to another question) and CACHE
+      in DB. Hindi is translated from the English explanation and cached too.
+    Response: {lang, explanation}
+    """
+    data = _json_body()
+    lang = (data.get("lang") or "en").lower()
+    q = Question.query.get_or_404(question_id)
+
+    # 1) Ensure an English explanation exists (file first, else AI once).
+    if not q.explanation:
+        try:
+            from app.services.knowledge_engine.free_ai_chain import generate_explanation_with_ai
+            opts = [{"option_key": o.option_key, "option_text": o.option_text} for o in (q.options or [])]
+            gen = generate_explanation_with_ai(
+                q.question_text, opts, q.get_correct_answer_parsed()
+            )
+            if gen:
+                q.explanation = gen[:2000]
+                try:
+                    db.session.commit()
+                except Exception:
+                    db.session.rollback()
+        except Exception:
+            logger.exception("explanation gen failed q=%s", question_id)
+
+    # 2) If Hindi asked and missing, translate the English explanation once.
+    if lang == "hi" and q.explanation and not q.explanation_hi:
+        try:
+            from app.services.knowledge_engine.free_ai_chain import translate_texts
+            tr = translate_texts([q.explanation], target_lang="hi")
+            if tr and tr[0]:
+                q.explanation_hi = tr[0][:2000]
+                try:
+                    db.session.commit()
+                except Exception:
+                    db.session.rollback()
+        except Exception:
+            logger.exception("explanation translate failed q=%s", question_id)
+
+    if lang == "hi":
+        return jsonify({"lang": "hi", "explanation": q.explanation_hi or q.explanation or ""})
+    return jsonify({"lang": "en", "explanation": q.explanation or ""})

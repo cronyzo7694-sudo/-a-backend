@@ -62,6 +62,15 @@ _QUESTION_COLUMNS: Sequence[Tuple[str, str]] = (
     ("memory_level", "INTEGER DEFAULT 3"),
     ("logic_level", "INTEGER DEFAULT 3"),
     ("calculation_level", "INTEGER DEFAULT 2"),
+    # Bilingual support (Hindi). Filled from file if present, else AI-translated
+    # on demand and cached here so we never re-translate (saves tokens).
+    ("question_text_hi", "TEXT"),
+    ("explanation_hi", "TEXT"),
+    ("paragraph_text_hi", "TEXT"),
+)
+
+_OPTION_COLUMNS: Sequence[Tuple[str, str]] = (
+    ("option_text_hi", "TEXT"),
 )
 
 _EXAM_COLUMNS: Sequence[Tuple[str, str]] = (
@@ -123,6 +132,7 @@ def ensure_additive_schema() -> None:
     _add_columns("users", _USER_COLUMNS)
     _add_columns("questions", _QUESTION_COLUMNS)
     _add_columns("exams", _EXAM_COLUMNS)
+    _add_columns("question_options", _OPTION_COLUMNS)
 
     # Helpful indexes (ignore failures) - including Knowledge Engine indexes
     index_ddls = [

@@ -972,3 +972,70 @@ def list_attempts():
 # - Server-side heartbeat remaining-time column
 # - Row-level locking on submit to prevent double-eval races under multi-worker
 # --------------------------------------------
+
+
+@attempts_bp.post("/questions/<int:question_id>/translate")
+@jwt_required()
+def translate_question(question_id):
+    """
+    Return a question + its options in the requested language.
+    * lang=hi (default): if Hindi already stored (from file), return it.
+      Otherwise AI-translate from English, CACHE in DB (so next time is free),
+      and return. lang=en returns the original English.
+    Response: {question_text, paragraph_text, explanation, options:[{option_key,option_text}]}
+    """
+    data = _json_body()
+    lang = (data.get("lang") or "hi").lower()
+    q = Question.query.get_or_404(question_id)
+
+    if lang == "en":
+        return jsonify({
+            "lang": "en",
+            "question_text": q.question_text,
+            "paragraph_text": q.paragraph_text,
+            "explanation": q.explanation,
+            "options": [{"option_key": o.option_key, "option_text": o.option_text} for o in (q.options or [])],
+        })
+
+    # lang == hi
+    opts = list(q.options or [])
+    have_all_hi = (
+        bool(q.question_text_hi)
+        and all(o.option_text_hi for o in opts)
+        and (not q.paragraph_text or q.paragraph_text_hi)
+    )
+    if not have_all_hi:
+        # Build the list to translate (question + paragraph + options [+ explanation])
+        try:
+            from app.services.knowledge_engine.free_ai_chain import translate_texts
+        except Exception:
+            translate_texts = None
+
+        if translate_texts is not None:
+            payload = [q.question_text or "", q.paragraph_text or "", q.explanation or ""]
+            payload += [o.option_text or "" for o in opts]
+            translated = translate_texts(payload, target_lang="hi")
+            if translated:
+                q.question_text_hi = translated[0] or q.question_text_hi
+                q.paragraph_text_hi = translated[1] or q.paragraph_text_hi
+                q.explanation_hi = translated[2] or q.explanation_hi
+                for o, t in zip(opts, translated[3:]):
+                    o.option_text_hi = t or o.option_text_hi
+                try:
+                    db.session.commit()  # cache so we never translate again
+                except Exception:
+                    db.session.rollback()
+                    logger.exception("translate cache commit failed q=%s", question_id)
+
+    # Return Hindi if available, else fall back to English (never blank)
+    return jsonify({
+        "lang": "hi",
+        "question_text": q.question_text_hi or q.question_text,
+        "paragraph_text": q.paragraph_text_hi or q.paragraph_text,
+        "explanation": q.explanation_hi or q.explanation,
+        "options": [
+            {"option_key": o.option_key, "option_text": o.option_text_hi or o.option_text}
+            for o in opts
+        ],
+        "translated": have_all_hi is False,
+    })

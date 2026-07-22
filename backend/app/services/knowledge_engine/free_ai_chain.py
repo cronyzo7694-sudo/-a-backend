@@ -366,3 +366,86 @@ def generate_explanation_with_ai(question_text, options, correct_answer):
         except Exception as e:
             logger.debug(f"Gemini explanation failed: {e}")
     return None
+
+
+# ===========================================================================
+# TRANSLATION (English <-> Hindi) — used when a language is missing in the file.
+# Results are cached in the DB by the caller so we never re-translate (saves tokens).
+# ===========================================================================
+def _gemini_translate(texts, target_lang="hi"):
+    """Translate a list of strings to target_lang. Returns list (same order) or None."""
+    if not GEMINI_API_KEY or not texts:
+        return None
+    try:
+        lang_name = "Hindi (Devanagari)" if target_lang == "hi" else "English"
+        # numbered payload keeps order stable
+        joined = "\n".join(f"{i+1}. {t}" for i, t in enumerate(texts))
+        prompt = (
+            f"Translate each numbered item to {lang_name}. Keep numbers, math, "
+            f"and option letters unchanged. Return ONLY JSON: "
+            f'{{"items":["translation1","translation2",...]}} in the SAME order.\n\n{joined}'
+        )
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}")
+        resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=25)
+        if resp.status_code == 200:
+            text = (resp.json().get("candidates", [{}])[0]
+                    .get("content", {}).get("parts", [{}])[0].get("text", ""))
+            if "{" in text:
+                data = json.loads(text[text.find("{"):text.rfind("}") + 1])
+                items = data.get("items")
+                if isinstance(items, list) and len(items) == len(texts):
+                    return [str(x) for x in items]
+    except Exception as e:
+        logger.debug(f"Gemini translate failed: {e}")
+    return None
+
+
+def _groq_translate(texts, target_lang="hi"):
+    if not GROQ_API_KEY or not texts:
+        return None
+    try:
+        lang_name = "Hindi (Devanagari)" if target_lang == "hi" else "English"
+        joined = "\n".join(f"{i+1}. {t}" for i, t in enumerate(texts))
+        prompt = (
+            f"Translate each numbered item to {lang_name}. Keep numbers/math/option "
+            f'letters. Return ONLY JSON {{"items":[...]}} same order.\n\n{joined}'
+        )
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        payload = {"model": "llama3-8b-8192",
+                   "messages": [{"role": "user", "content": prompt}],
+                   "temperature": 0.1, "max_tokens": 2000}
+        resp = requests.post(url, json=payload, headers=headers, timeout=25)
+        if resp.status_code == 200:
+            text = resp.json()["choices"][0]["message"]["content"]
+            if "{" in text:
+                data = json.loads(text[text.find("{"):text.rfind("}") + 1])
+                items = data.get("items")
+                if isinstance(items, list) and len(items) == len(texts):
+                    return [str(x) for x in items]
+    except Exception as e:
+        logger.debug(f"Groq translate failed: {e}")
+    return None
+
+
+def translate_texts(texts, target_lang="hi"):
+    """
+    Translate a list of strings. Tries Gemini -> Groq. Returns list (same order)
+    or None if no key / all failed. Empty strings are passed through.
+    """
+    if not texts:
+        return texts
+    # keep only non-empty for translation, remember positions
+    idx = [i for i, t in enumerate(texts) if t and str(t).strip()]
+    if not idx:
+        return list(texts)
+    payload = [str(texts[i]) for i in idx]
+    for fn in (_gemini_translate, _groq_translate):
+        res = fn(payload, target_lang)
+        if res:
+            out = list(texts)
+            for pos, val in zip(idx, res):
+                out[pos] = val
+            return out
+    return None

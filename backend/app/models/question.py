@@ -122,8 +122,11 @@ class Question(db.Model):
     question_text = db.Column(db.Text, nullable=False)
     question_html = db.Column(db.Text, nullable=True)
     question_markdown = db.Column(db.Text, nullable=True)
+    question_text_hi = db.Column(db.Text, nullable=True)  # Hindi (file or AI-cached)
     explanation = db.Column(db.Text, nullable=True)
     explanation_html = db.Column(db.Text, nullable=True)
+    explanation_hi = db.Column(db.Text, nullable=True)  # Hindi explanation
+    paragraph_text_hi = db.Column(db.Text, nullable=True)  # Hindi paragraph stem
     explanation_markdown = db.Column(db.Text, nullable=True)
 
     # Paragraph stem (for paragraph-based questions)
@@ -279,8 +282,10 @@ class Question(db.Model):
             "question_text": self.question_text,
             "question_html": self.question_html,
             "question_markdown": getattr(self, "question_markdown", None),
+            "question_text_hi": getattr(self, "question_text_hi", None),
             "paragraph_text": self.paragraph_text,
             "paragraph_html": self.paragraph_html,
+            "paragraph_text_hi": getattr(self, "paragraph_text_hi", None),
             "image_url": self.image_url,
             "media": self.get_media(),
             "marks": float(self.marks) if self.marks is not None else 0.0,
@@ -308,6 +313,7 @@ class Question(db.Model):
         if include_explanation:
             data["explanation"] = self.explanation
             data["explanation_html"] = self.explanation_html
+            data["explanation_hi"] = getattr(self, "explanation_hi", None)
         return data
 
     def __repr__(self) -> str:
@@ -327,6 +333,7 @@ class QuestionOption(db.Model):
     option_key = db.Column(db.String(8), nullable=False)  # A, B, C, D, E...
     option_text = db.Column(db.Text, nullable=False)
     option_html = db.Column(db.Text, nullable=True)
+    option_text_hi = db.Column(db.Text, nullable=True)  # Hindi (file or AI-cached)
     image_url = db.Column(db.String(512), nullable=True)
     order_index = db.Column(db.Integer, default=0, nullable=False)
 
@@ -338,6 +345,7 @@ class QuestionOption(db.Model):
             "option_key": self.option_key,
             "option_text": self.option_text,
             "option_html": self.option_html,
+            "option_text_hi": self.option_text_hi,
             "image_url": self.image_url,
             "order_index": self.order_index if self.order_index is not None else 0,
         }

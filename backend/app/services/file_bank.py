@@ -93,6 +93,35 @@ def _normspace(s):
     return re.sub(r"\s+", " ", s or "").strip()
 
 
+# Devanagari (Hindi) unicode range
+_DEVANAGARI = re.compile(r"[\u0900-\u097F]")
+
+
+def _has_hindi(s):
+    return bool(s and _DEVANAGARI.search(s))
+
+
+def _split_en_hi(text):
+    """
+    Given a chunk that may contain an English line followed by its Hindi line
+    (Devanagari), return (english_part, hindi_part). If no Hindi present,
+    hindi_part is "". Splits line-by-line: lines with Devanagari -> Hindi,
+    others -> English. Order is preserved within each language.
+    """
+    if not text:
+        return "", ""
+    en_lines, hi_lines = [], []
+    for raw in re.split(r"[\n\r]+", text):
+        line = raw.strip()
+        if not line:
+            continue
+        if _has_hindi(line):
+            hi_lines.append(line)
+        else:
+            en_lines.append(line)
+    return _normspace(" ".join(en_lines)), _normspace(" ".join(hi_lines))
+
+
 def _strip_junk(s):
     s = re.sub(r"www\.ssccglpinnacle\.com.*?(?:\n|$)", " ", s, flags=re.I)
     s = re.sub(r"Download\s+Pinnacle.*?(?:\n|$)", " ", s, flags=re.I)
@@ -302,25 +331,40 @@ def _parse_question_blocks(body_region):
         if len(opts) < 2:
             continue
 
-        # question text = everything before first "(a)"
+        # question text = everything before first "(a)" (keep newlines for EN/HI split)
         qsplit = re.split(r"\(\s*a\s*\)", block, flags=re.I)
-        qtext = qsplit[0] if qsplit else block[:500]
-        exam_hint_m = re.search(r"(SSC[^\n(]*\([^)]*\))", qtext)
+        qraw = qsplit[0] if qsplit else block[:500]
+        exam_hint_m = re.search(r"(SSC[^\n(]*\([^)]*\))", qraw)
         exam_hint = _normspace(exam_hint_m.group(1)) if exam_hint_m else None
-        qtext = re.sub(r"SSC[^\n]*", "", qtext)     # drop exam-line noise from stem
-        qtext = _normspace(_strip_junk(qtext))[:1200]
-        if len(qtext) < 6:
+        qraw = re.sub(r"SSC[^\n]*", "", qraw)  # drop exam-line noise from stem
+        qraw = _strip_junk(qraw)
+        # Split English vs Hindi (Devanagari lines are Hindi).
+        q_en, q_hi = _split_en_hi(qraw)
+        qtext = (q_en or q_hi)[:1200]        # English is primary; fall back to Hindi
+        qtext_hi = q_hi[:1200] if q_hi else None
+        if len(qtext) < 3:
             continue
 
         options = []
         for k, v in opts[:4]:
-            v = _normspace(_strip_junk(v))[:300]
-            if v:
-                options.append({"option_key": k.upper(), "option_text": v})
+            v = _strip_junk(v)
+            o_en, o_hi = _split_en_hi(v)
+            otext = (o_en or o_hi)[:300]
+            if otext:
+                options.append({
+                    "option_key": k.upper(),
+                    "option_text": otext,
+                    "option_text_hi": (o_hi[:300] if o_hi else None),
+                })
         if len(options) < 2:
             continue
 
-        out[qn] = {"question_text": qtext, "options": options, "exam_hint": exam_hint}
+        out[qn] = {
+            "question_text": qtext,
+            "question_text_hi": qtext_hi,
+            "options": options,
+            "exam_hint": exam_hint,
+        }
     return out
 
 
@@ -388,6 +432,7 @@ def load_questions_from_files():
                     "id": f"file_{txt_file.stem}_{qn}",
                     "qnum": qn,
                     "question_text": qtext,
+                    "question_text_hi": q.get("question_text_hi"),  # Hindi from file (or None)
                     "options": options,
                     "correct_answer": correct,          # <-- REAL answer (or None)
                     "explanation": explanation,         # <-- REAL solution text

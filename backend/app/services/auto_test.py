@@ -267,8 +267,10 @@ def _build_test(exam: Exam, scope: str, subject: Optional[str],
         valid = {str(o.get("option_key", "")).upper() for o in options}
         if correct not in valid:
             continue
+        q_hi = q.get("question_text_hi")
         qq = Question(
             question_text=q["question_text"][:2000],
+            question_text_hi=(q_hi[:2000] if q_hi else None),  # Hindi from file
             question_type="single_choice",
             difficulty=q.get("difficulty", "medium") if q.get("difficulty") in ("easy", "medium", "hard") else "medium",
             correct_answer=correct,
@@ -280,9 +282,12 @@ def _build_test(exam: Exam, scope: str, subject: Optional[str],
         db.session.add(qq)
         db.session.flush()
         for oi, opt in enumerate(options):
+            o_hi = opt.get("option_text_hi")
             db.session.add(QuestionOption(
                 question_id=qq.id, option_key=opt.get("option_key", "A"),
-                option_text=opt.get("option_text", "")[:500], order_index=oi))
+                option_text=opt.get("option_text", "")[:500],
+                option_text_hi=(o_hi[:500] if o_hi else None),
+                order_index=oi))
         db.session.add(ExamQuestion(
             exam_id=exam_obj.id, section_id=section.id, question_id=qq.id,
             order_index=added, marks=2, negative_marks=0.5))

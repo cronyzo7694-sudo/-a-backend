@@ -1,52 +1,50 @@
-"""WSGI entry for production process managers.
+"""WSGI entry — MUST stay cheap to import.
 
-Usage:
+Render scans for an open port within ~5 minutes. If we call create_app()
+at import time, file-bank parse + Neon schema blocks gunicorn BEFORE it
+binds → "No open ports" / deploy timeout.
 
-    gunicorn --bind 0.0.0.0:$PORT wsgi:app
-
-Public name ``app`` is stable for Render/Gunicorn deploy configs.
+`app` is a lazy WSGI wrapper: import is instant, bind happens immediately,
+Flask boots on the first request (or when a worker warms up).
 """
 
 from __future__ import annotations
 
 import logging
 
-from app import create_app
-
-
 logger = logging.getLogger("exam_os.wsgi")
 
 
-# Main Flask application create karo
-app = create_app()
+class LazyFlaskApp:
+    """WSGI callable that builds the real Flask app on first use."""
+
+    def __init__(self) -> None:
+        self._app = None
+
+    def _load(self):
+        if self._app is None:
+            logger.warning("Bootstrapping Flask app (first load)…")
+            from app import create_app
+
+            self._app = create_app()
+            try:
+                from debug_panel import debug_bp, install_debug_handlers
+
+                self._app.register_blueprint(debug_bp)
+                install_debug_handlers(self._app)
+            except ModuleNotFoundError:
+                pass
+            except Exception:
+                logger.exception("debug panel skipped")
+            logger.warning("Flask app ready")
+        return self._app
+
+    def __call__(self, environ, start_response):
+        return self._load()(environ, start_response)
+
+    def __getattr__(self, name):
+        # gunicorn / flask-migrate sometimes poke attributes
+        return getattr(self._load(), name)
 
 
-# Temporary debug panel attach karo
-#
-# debug_panel.py isi folder me hona chahiye:
-# backend/debug_panel.py
-#
-# Agar debug_panel.py missing hua to backend start nahi hoga,
-# isliye import ko safe rakha gaya hai.
-try:
-    from debug_panel import debug_bp, install_debug_handlers
-
-    app.register_blueprint(debug_bp)
-    install_debug_handlers(app)
-
-    logger.warning(
-        "DEBUG PANEL ENABLED: /debug, /debug/routes, "
-        "/debug/health, /debug/errors"
-    )
-
-except ModuleNotFoundError as exc:
-    if exc.name == "debug_panel":
-        logger.warning(
-            "debug_panel.py not found; starting backend without debug panel"
-        )
-    else:
-        raise
-
-except Exception:
-    logger.exception("Failed to register debug panel")
-    raise
+app = LazyFlaskApp()

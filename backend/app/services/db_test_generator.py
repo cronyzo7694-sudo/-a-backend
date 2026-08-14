@@ -64,10 +64,12 @@ def _db_pool(subject: Optional[str], chapter: Optional[str], topic: Optional[str
     query = Question.query.filter_by(is_active=True)
     if subject:
         query = query.join(Subject, Question.subject_id == Subject.id).filter(Subject.name.ilike(subject))
-    if chapter:
-        query = query.join(Chapter, Question.chapter_id == Chapter.id).filter(Chapter.name.ilike(chapter))
-    if topic:
-        query = query.join(Chapter).filter(Chapter.name.ilike(topic))
+    if chapter or topic:
+        query = query.join(Chapter, Question.chapter_id == Chapter.id)
+        if chapter:
+            query = query.filter(Chapter.name.ilike(chapter))
+        if topic:
+            query = query.filter(Chapter.name.ilike(topic))
     return query.limit(_MAX_POOL).all()
 
 
@@ -179,10 +181,10 @@ def generate_db_tests_for_exam(exam: Exam) -> Dict:
         chapter_covered = {}
         for chapter in sorted(chapters):
             chap_count = inv["chapters"].get((subject, chapter), 0)
-            topics_here = [(t, c) for (s, c, t), cnt in inv["topics"].items() if s == subject and c == chapter]
+            topics_here = [(t, cnt) for (s, c, t), cnt in inv["topics"].items() if s == subject and c == chapter]
             topic_made = False
-            for (t, cnt) in topics_here:
-                if cnt >= _MIN_TOPIC:
+            for (t, topic_cnt) in topics_here:
+                if topic_cnt >= _MIN_TOPIC:
                     ok = _try("topic_wise", subject, chapter, t, f"{t} - Topic Test")
                     topic_made = topic_made or ok
             chapter_made = False

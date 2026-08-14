@@ -243,9 +243,12 @@ def generate_db_tests_for_exam(exam: Exam) -> Dict:
         if all_covered and covered_count >= 2:
             _try("subject_wise", subject, None, None, f"{subject} - Subject Test")
 
-    # Full mock if multiple subjects have DB questions
-    if len(subjects) >= 2:
-        _try("full_mock", None, None, None, f"{exam.title} - Full Test")
+    # NOTE: Full mock is intentionally DISABLED for now. Questions are still
+    # being added subject-by-subject, so a real-exam-style full mock would be
+    # incomplete (only 1-2 subjects present). We'll enable it once all subjects
+    # (Quant + Reasoning + English + GA) have enough questions.
+    # if len(subjects) >= 2:
+    #     _try("full_mock", None, None, None, f"{exam.title} - Full Test")
 
     total_children = Exam.query.filter_by(parent_exam_id=exam.id).count()
     coming_soon = total_children == 0

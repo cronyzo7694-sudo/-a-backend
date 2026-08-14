@@ -123,11 +123,12 @@ def list_exams():
         # Loading sections here caused huge JOINs (sections->exam_questions->
         # questions->options) and made the list slow under load.
         d = e.to_dict(include_sections=False)
+        # AUTO coming-soon: an exam is "coming soon" only when it has no
+        # questions/tests yet. If it has questions it is active/playable.
         try:
-            cs = (e.get_rules() or {}).get("coming_soon") or {}
-            d["coming_soon"] = bool(cs.get("active"))
+            d["coming_soon"] = (d.get("total_questions") or 0) < 1
         except Exception:
-            d["coming_soon"] = False
+            d["coming_soon"] = (e.total_questions or 0) < 1
         return d
 
     return jsonify({
@@ -160,8 +161,8 @@ def get_exam(exam_id):
                 cd = c.to_dict(include_sections=False)
                 try:
                     crules = c.get_rules() or {}
-                    ccs = crules.get("coming_soon") or {}
-                    cd["coming_soon"] = bool(ccs.get("active"))
+                    # AUTO coming-soon: has questions => active/playable.
+                    cd["coming_soon"] = (c.total_questions or 0) < 1
                     # Show the REAL per-attempt question count (what a student
                     # actually sees), not the whole shared pool size.
                     fb = crules.get("file_bank_source") or {}
@@ -174,7 +175,7 @@ def get_exam(exam_id):
                         per_q = float(cd.get("default_marks") or 2)
                         cd["total_marks"] = round(qpa * per_q, 2)
                 except Exception:
-                    cd["coming_soon"] = False
+                    cd["coming_soon"] = (c.total_questions or 0) < 1
                 child_list.append(cd)
             data["children"] = child_list
     if include_q and claims.get("role") != "admin":
@@ -184,13 +185,15 @@ def get_exam(exam_id):
         data["resolved_rules"] = ExamRuleEngine.from_exam(exam).to_public_dict()
     except Exception:
         data["resolved_rules"] = {}
-    # Additive: coming-soon flag (exam has no tests yet, questions not in files)
+    # Additive: AUTO coming-soon flag — an exam is "coming soon" only when it
+    # has no questions/tests yet; if it has questions it is active/playable.
     try:
-        cs = (exam.get_rules() or {}).get("coming_soon") or {}
-        data["coming_soon"] = bool(cs.get("active"))
-        data["coming_soon_reason"] = cs.get("reason", "")
+        data["coming_soon"] = (exam.total_questions or 0) < 1
+        data["coming_soon_reason"] = (
+            "Questions abhi add nahi hue hain" if (exam.total_questions or 0) < 1 else ""
+        )
     except Exception:
-        data["coming_soon"] = False
+        data["coming_soon"] = (exam.total_questions or 0) < 1
     return jsonify(data)
 
 

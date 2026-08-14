@@ -818,3 +818,83 @@ def factory_reset():
         db.session.rollback()
         logger.exception("factory_reset failed")
         return jsonify({"error": str(e)[:300]}), 500
+
+
+@exams_bp.post("/admin/fix-number-system")
+@roles_required("admin")
+def fix_number_system():
+    """Whitelist cleanup: SSC Number System (chapter_id=28) questions should
+    ONLY be assigned to the 7 SSC exams that have a maths/quant section:
+      1846(CGL-T1),1847(CGL-T2),1848(CHSL),1849(MTS),1850(GD),1851(CPO),1854(Selection Post)
+    Remove them from EVERY other exam. Also NULL out attempt_answers links first
+    to avoid FK violations (attempt_answers.exam_question_id has no CASCADE)."""
+    import logging as _lg
+    from app.extensions import db as _db
+    from app.models.question import Question
+    from app.models.exam import ExamQuestion, Attempt  # Attempt not used directly
+    from sqlalchemy import text
+
+    chapter_id = 28  # Number System
+    allowed = [1846, 1847, 1848, 1849, 1850, 1851, 1854]
+
+    # question ids in this chapter
+    qids = [q.id for q in Question.query.filter_by(chapter_id=chapter_id).all()]
+    if not qids:
+        return jsonify({"message": "No Number System questions found", "removed": 0}), 200
+
+    # 1) find the exam_questions rows to delete (this chapter, in non-allowed exams)
+    bad_eq = (ExamQuestion.query
+              .filter(ExamQuestion.question_id.in_(qids))
+              .filter(~ExamQuestion.exam_id.in_(allowed))
+              .all())
+    bad_ids = [eq.id for eq in bad_eq]
+
+    # 2) NULL out attempt_answers.exam_question_id that point at them (FK no cascade)
+    if bad_ids:
+        try:
+            _db.session.execute(
+                text("UPDATE attempt_answers SET exam_question_id = NULL "
+                     "WHERE exam_question_id IN :ids").bindparams(ids=tuple(bad_ids))
+            )
+        except Exception:
+            try:
+                # chunk if tuple bind unsupported
+                for chunk in [bad_ids[i:i+500] for i in range(0, len(bad_ids), 500)]:
+                    _db.session.execute(
+                        text("UPDATE attempt_answers SET exam_question_id = NULL "
+                             "WHERE exam_question_id = ANY(:ids)").bindparams(ids=chunk)
+                    )
+            except Exception as e2:
+                _lg.error("attempt_answers null failed: %s", e2)
+
+    # 3) delete the bad exam_questions
+    removed = 0
+    for eq in bad_eq:
+        try:
+            _db.session.delete(eq)
+            removed += 1
+        except Exception:
+            _db.session.rollback()
+
+    # 4) recalc totals for affected exams
+    affected = set([eq.exam_id for eq in bad_eq]) | set(allowed)
+    for eid in affected:
+        cnt = ExamQuestion.query.filter_by(exam_id=eid).count()
+        marks = _db.session.execute(
+            text("SELECT COALESCE(SUM(eq.marks),0) FROM exam_questions eq WHERE eq.exam_id=:e")
+            .bindparams(e=eid)).scalar() or 0
+        from app.models.exam import Exam
+        ex = Exam.query.get(eid)
+        if ex:
+            ex.total_questions = cnt
+            ex.total_marks = float(marks or 0)
+
+    _db.session.commit()
+    return jsonify({
+        "message": "Number System fixed",
+        "chapter_id": chapter_id,
+        "allowed_exams": allowed,
+        "bad_exam_questions_found": len(bad_ids),
+        "removed": removed,
+        "removed_from": sorted(set([eq.exam_id for eq in bad_eq])),
+    }), 200

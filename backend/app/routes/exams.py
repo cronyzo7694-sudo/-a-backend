@@ -904,4 +904,22 @@ def debug_exam_subjects(exam_id):
         "FROM exam_questions eq JOIN questions q ON q.id = eq.question_id "
         "WHERE eq.exam_id = :e GROUP BY q.subject_id, q.chapter_id"
     ).bindparams(e=exam_id)).fetchall()
-    return jsonify({"exam_id": exam_id, "groups": [{"subject_id": r[0], "chapter_id": r[1], "count": r[2]} for r in rows]})
+    raw = _db.session.execute(text(
+        "SELECT eq.id AS eq_id, eq.question_id, eq.section_id, eq.exam_id "
+        "FROM exam_questions eq WHERE eq.exam_id = :e LIMIT 5"
+    ).bindparams(e=exam_id)).fetchall()
+    missing = _db.session.execute(text(
+        "SELECT count(*) FROM exam_questions eq "
+        "LEFT JOIN questions q ON q.id = eq.question_id "
+        "WHERE eq.exam_id = :e AND q.id IS NULL"
+    ).bindparams(e=exam_id)).scalar()
+    total = _db.session.execute(text(
+        "SELECT count(*) FROM exam_questions WHERE exam_id = :e"
+    ).bindparams(e=exam_id)).scalar()
+    return jsonify({
+        "exam_id": exam_id,
+        "total_exam_questions": total,
+        "groups": [{"subject_id": r[0], "chapter_id": r[1], "count": r[2]} for r in rows],
+        "missing_question_rows": missing,
+        "sample_raw": [{"eq_id": r[0], "question_id": r[1], "section_id": r[2]} for r in raw],
+    })

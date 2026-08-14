@@ -138,6 +138,7 @@ def _register_blueprints(app: Flask) -> None:
     from app.routes.notifications import notifications_bp
     from app.routes.questions import questions_bp
     from app.routes.subjects import subjects_bp
+    from app.routes.messages import messages_bp
 
     # URL prefixes are part of the public API contract — do not change
     app.register_blueprint(auth_bp, url_prefix="/api/auth")
@@ -152,6 +153,7 @@ def _register_blueprints(app: Flask) -> None:
     app.register_blueprint(banks_bp, url_prefix="/api/banks")
     app.register_blueprint(platform_bp, url_prefix="/api/platform")
     app.register_blueprint(notifications_bp, url_prefix="/api/notifications")
+    app.register_blueprint(messages_bp, url_prefix="/api/messages")
 
     # --------------------------------------------
     # EXTENSION POINT: Register additional blueprints here

@@ -38,6 +38,7 @@ from app.models.notification import (
     NotificationDelivery,
 )
 from app.models.knowledge import QuestionAppearance, KnowledgeIngestionJob
+from app.models.user_message import UserMessage
 
 __all__ = [
     "User",
@@ -68,4 +69,5 @@ __all__ = [
     "NotificationDelivery",
     "QuestionAppearance",
     "KnowledgeIngestionJob",
+    "UserMessage",
 ]

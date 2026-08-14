@@ -831,7 +831,7 @@ def fix_number_system():
     import logging as _lg
     from app.extensions import db as _db
     from app.models.question import Question
-    from app.models.exam import ExamQuestion, Attempt  # Attempt not used directly
+    from app.models.exam import ExamQuestion
     from sqlalchemy import text
 
     chapter_id = 28  # Number System
@@ -852,20 +852,13 @@ def fix_number_system():
     # 2) NULL out attempt_answers.exam_question_id that point at them (FK no cascade)
     if bad_ids:
         try:
-            _db.session.execute(
-                text("UPDATE attempt_answers SET exam_question_id = NULL "
-                     "WHERE exam_question_id IN :ids").bindparams(ids=tuple(bad_ids))
-            )
-        except Exception:
-            try:
-                # chunk if tuple bind unsupported
-                for chunk in [bad_ids[i:i+500] for i in range(0, len(bad_ids), 500)]:
-                    _db.session.execute(
-                        text("UPDATE attempt_answers SET exam_question_id = NULL "
-                             "WHERE exam_question_id = ANY(:ids)").bindparams(ids=chunk)
-                    )
-            except Exception as e2:
-                _lg.error("attempt_answers null failed: %s", e2)
+            for chunk in [bad_ids[i:i+500] for i in range(0, len(bad_ids), 500)]:
+                _db.session.execute(
+                    text("UPDATE attempt_answers SET exam_question_id = NULL "
+                         "WHERE exam_question_id = ANY(:ids)").bindparams(ids=chunk)
+                )
+        except Exception as e2:
+            _lg.error("attempt_answers null failed: %s", e2)
 
     # 3) delete the bad exam_questions
     removed = 0

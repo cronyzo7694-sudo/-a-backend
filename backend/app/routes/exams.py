@@ -891,3 +891,17 @@ def fix_number_system():
         "removed": removed,
         "removed_from": sorted(set([eq.exam_id for eq in bad_eq])),
     }), 200
+
+
+@exams_bp.get("/admin/debug-exam-subjects/<int:exam_id>")
+@roles_required("admin")
+def debug_exam_subjects(exam_id):
+    """Debug: list subject_id + chapter_id of questions in a given exam."""
+    from app.extensions import db as _db
+    from sqlalchemy import text
+    rows = _db.session.execute(text(
+        "SELECT q.subject_id, q.chapter_id, count(*) AS n "
+        "FROM exam_questions eq JOIN questions q ON q.id = eq.question_id "
+        "WHERE eq.exam_id = :e GROUP BY q.subject_id, q.chapter_id"
+    ).bindparams(e=exam_id)).fetchall()
+    return jsonify({"exam_id": exam_id, "groups": [{"subject_id": r[0], "chapter_id": r[1], "count": r[2]} for r in rows]})

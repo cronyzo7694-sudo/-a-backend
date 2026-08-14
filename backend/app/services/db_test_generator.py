@@ -26,10 +26,51 @@ from app.models.bank import Topic
 logger = logging.getLogger("exam_os.services.db_test_generator")
 
 # How many questions an attempt should show per scope.
-PER_ATTEMPT = {"topic_wise": 15, "chapter_wise": 20, "subject_wise": 25, "full_mock": 30}
+# (User spec: topic test = 10, chapter test = 15, subject test = 25,
+#  full test = as many as the REAL exam pattern has.)
+PER_ATTEMPT = {"topic_wise": 10, "chapter_wise": 15, "subject_wise": 25, "full_mock": 0}
 _MIN_TOPIC = 5      # minimum questions to build a topic test
 _MIN_CHAPTER = 8    # minimum questions to build a chapter test
 _MAX_POOL = 500
+
+# REAL full-mock question counts per exam (by matching title keywords).
+REAL_FULL_COUNTS = {
+    "ssc cgl tier-1": 100,
+    "ssc cgl tier-2": 150,
+    "ssc chsl": 100,
+    "ssc mts": 90,
+    "ssc gd": 80,
+    "ssc cpo": 200,
+    "ssc je": 200,
+    "ssc stenographer": 200,
+    "ssc selection post": 100,
+}
+
+
+def _real_full_count(exam_title: str) -> int:
+    """Return the real exam's total question count for a full mock, or 0 if
+    unknown (caller falls back to available pool size)."""
+    t = (exam_title or "").lower()
+    # order matters: check longer/more specific keys first
+    for key, count in REAL_FULL_COUNTS.items():
+        if key in t:
+            return count
+    return 0
+
+
+def _per_attempt(scope: str, exam: Exam, pool_size: int) -> int:
+    """Decide how many questions an attempt shows.
+    - topic/chapter/subject: fixed counts (10 / 15 / 25)
+    - full_mock: the real exam's total question count (capped at pool size)."""
+    if scope == "full_mock":
+        want = _real_full_count(exam.title)
+        if want <= 0:
+            want = pool_size  # fallback: show everything we have
+        return min(want, pool_size)
+    n = PER_ATTEMPT.get(scope, 0)
+    if n <= 0:
+        return pool_size
+    return min(n, pool_size)
 
 
 def _canon(subject: Optional[str], chapter: Optional[str]) -> Tuple[str, str]:
@@ -80,18 +121,20 @@ def _auto_key(scope: str, subject: str, chapter: str, topic: str) -> str:
 def _build_test(exam: Exam, scope: str, subject: Optional[str],
                 chapter: Optional[str], topic: Optional[str],
                 auto_key: str, title: str) -> Optional[Exam]:
-    per_attempt = PER_ATTEMPT.get(scope, 20)
     pool = _db_pool(subject, chapter, topic)
     # filter to answerable
     answerable = [q for q in pool if q.correct_answer]
-    if scope == "topic_wise":
-        if len(answerable) < _MIN_TOPIC:
-            return None
-    else:
-        if len(answerable) < _MIN_CHAPTER:
-            return None
     if not answerable:
         return None
+    min_needed = _MIN_TOPIC if scope == "topic_wise" else _MIN_CHAPTER
+    if len(answerable) < min_needed:
+        return None
+
+    # Decide how many questions this attempt shows (topic=10, chapter=15,
+    # subject=25, full=real exam count), capped by how many we actually have.
+    per_attempt = _per_attempt(scope, exam, len(answerable))
+    if per_attempt <= 0:
+        per_attempt = len(answerable)
 
     test_mode = "pyq" if any(q.source and q.source.strip() for q in answerable) else "mock"
 
@@ -112,19 +155,22 @@ def _build_test(exam: Exam, scope: str, subject: Optional[str],
     db.session.add(section)
     db.session.flush()
 
-    # Reuse existing DB questions (no duplicates created).
+    # Pick a fresh shuffled subset of `per_attempt` questions, assigning each
+    # to the child test. Reuses existing DB questions (no duplicates created).
+    import random
+    chosen = random.sample(answerable, min(per_attempt, len(answerable)))
     added = 0
-    for q in answerable:
+    for q in chosen:
         db.session.add(ExamQuestion(
             exam_id=child.id, section_id=section.id, question_id=q.id,
             order_index=added, marks=float(q.marks or 2), negative_marks=float(q.negative_marks or 0.5)))
         added += 1
 
-    if added < _MIN_TOPIC:
+    if added < min_needed:
         db.session.rollback()
         return None
 
-    shown = min(per_attempt, added)
+    shown = added
     child.recalculate_totals()
     child.duration_seconds = max(60, shown * 60)
     rules = child.get_rules() or {}

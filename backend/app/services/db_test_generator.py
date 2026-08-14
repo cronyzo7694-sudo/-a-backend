@@ -21,6 +21,7 @@ from app.models.exam import Exam, ExamQuestion, ExamSection
 from app.models.question import Question, QuestionOption
 from app.models.subject import Subject
 from app.models.chapter import Chapter
+from app.models.bank import Topic
 
 logger = logging.getLogger("exam_os.services.db_test_generator")
 
@@ -42,10 +43,16 @@ def _db_inventory() -> Dict:
     subjects: Dict[str, int] = defaultdict(int)
 
     qs = Question.query.filter_by(is_active=True).all()
+    # Resolve topic names from the topics table (Question has topic_id, not a rel).
+    topic_names = {}
+    for q in qs:
+        if q.topic_id and q.topic_id not in topic_names:
+            t = Topic.query.get(q.topic_id)
+            topic_names[q.topic_id] = t.name if t else None
     for q in qs:
         subj = (q.subject.name if q.subject else "General")
         chap = (q.chapter.name if q.chapter else "General")
-        topic = (q.topic.name if q.topic and q.topic.name else chap)
+        topic = topic_names.get(q.topic_id) or chap
         topics[(subj, chap, topic)] += 1
         chapters[(subj, chap)] += 1
         subjects[subj] += 1

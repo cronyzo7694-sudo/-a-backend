@@ -714,6 +714,36 @@ def generate_tests(exam_id):
         return jsonify({"error": str(e)[:300]}), 500
 
 
+@exams_bp.post("/<int:exam_id>/generate-db-tests")
+@roles_required("admin")
+def generate_db_tests(exam_id):
+    """Generate File-Bank-style child tests (topic/chapter/subject/full) for
+    ONE exam, but from the Neon questions table instead of .txt files."""
+    exam = Exam.query.get_or_404(exam_id)
+    try:
+        from app.services.db_test_generator import generate_db_tests_for_exam
+        summary = generate_db_tests_for_exam(exam)
+        return jsonify({"message": "DB tests generated", **summary})
+    except Exception as e:
+        db.session.rollback()
+        logger.exception("generate_db_tests failed exam=%s", exam_id)
+        return jsonify({"error": str(e)[:300]}), 500
+
+
+@exams_bp.post("/admin/generate-db-tests")
+@roles_required("admin")
+def generate_db_tests_all():
+    """Generate DB-driven child tests for EVERY published top-level exam."""
+    try:
+        from app.services.db_test_generator import generate_db_tests_all as _all
+        summary = _all()
+        return jsonify({"message": "All DB tests generated", **summary})
+    except Exception as e:
+        db.session.rollback()
+        logger.exception("generate_db_tests_all failed")
+        return jsonify({"error": str(e)[:300]}), 500
+
+
 @exams_bp.post("/<int:exam_id>/rebuild-tests")
 @roles_required("admin")
 def rebuild_tests(exam_id):
